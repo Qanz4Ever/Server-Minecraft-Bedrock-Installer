@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Auto Installer v5.7 - Enterprise Edition
-# Fixed SSH detection + Simple tmux service + Security hardening
+# Minecraft Bedrock Server Auto Installer v5.8 - Enterprise Edition
+# Fixed SSH service detection + Fallback mechanism
 
 # Warna untuk output
 RED='\033[0;31m'
@@ -14,12 +14,11 @@ WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Konfigurasi global
-SCRIPT_VERSION="5.7"
+SCRIPT_VERSION="5.8"
 MIN_DISK_SPACE=1024  # MB
 MIN_RAM_PER_SERVER=512  # MB
 SSH_PORT=22
 BASE_PATH="/home/minecraft"
-JAIL_BASE="/var/chroot"
 
 # Language variables
 LANG_EN=0
@@ -32,7 +31,7 @@ clear_screen() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - Security Hardened)        ║"
+    echo "║         (Enterprise Edition - Fixed SSH)                ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -193,19 +192,43 @@ configure_ssh() {
     restart_ssh_service
 }
 
-# Fungsi untuk restart SSH service
+# Fungsi untuk restart SSH service - FIXED VERSION
 restart_ssh_service() {
     info "$(t "Restarting SSH service..." "Merestart service SSH...")"
     
-    if systemctl list-units --full -all | grep -q "sshd.service"; then
-        systemctl restart sshd
-        success "sshd.service restarted"
-    elif systemctl list-units --full -all | grep -q "ssh.service"; then
-        systemctl restart ssh
-        success "ssh.service restarted"
-    else
-        warning "$(t "SSH service not found, trying to start..." "Service SSH tidak ditemukan, mencoba memulai...")"
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    local ssh_services=("ssh" "sshd")
+    local restarted=0
+    
+    for service in "${ssh_services[@]}"; do
+        if systemctl list-units --full -all | grep -q "$service.service"; then
+            info "$(t "Found" "Ditemukan") $service.service, $(t "restarting..." "merestart...")"
+            systemctl restart "$service"
+            if [ $? -eq 0 ]; then
+                success "$service.service $(t "restarted successfully" "berhasil direstart")"
+                restarted=1
+                break
+            else
+                warning "$(t "Failed to restart" "Gagal merestart") $service.service"
+            fi
+        fi
+    done
+    
+    if [ $restarted -eq 0 ]; then
+        warning "$(t "No SSH service found. Trying to start ssh service..." "Tidak ada service SSH ditemukan. Mencoba memulai service ssh...")"
+        systemctl start ssh 2>/dev/null || systemctl start sshd 2>/dev/null
+        
+        # Check if any started
+        for service in "${ssh_services[@]}"; do
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                success "$service.service $(t "started" "dimulai")"
+                restarted=1
+                break
+            fi
+        done
+        
+        if [ $restarted -eq 0 ]; then
+            error "$(t "Could not start any SSH service" "Tidak dapat memulai service SSH apapun")"
+        fi
     fi
 }
 
@@ -622,7 +645,7 @@ EOF
     return 0
 }
 
-# Fungsi untuk membuat systemd service - CHANGED to Type=simple
+# Fungsi untuk membuat systemd service
 create_systemd() {
     local config=$1
     IFS='|' read -r username server_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
@@ -648,7 +671,6 @@ create_systemd() {
     local ram_per_server=$((total_ram / jumlah_server))
     [ $ram_per_server -gt 2048 ] && ram_per_server=2048
     
-    # FIXED: Type=simple for tmux + Kill existing session before starting
     cat > "$service_file" << EOF
 [Unit]
 Description=Minecraft Bedrock Server - $server_name
@@ -719,13 +741,11 @@ start_all_servers() {
         if systemctl is-active --quiet "$username.service"; then
             success "$username $(t "running" "berjalan")"
             
-            # FIXED: PID detection using pgrep with username
             local pid=$(pgrep -u "$username" -f "bedrock_server" | head -1)
             if [ -n "$pid" ]; then
                 success "PID: $pid"
             fi
             
-            # Check tmux session
             if tmux has-session -t "$username" 2>/dev/null; then
                 success "Tmux session: $username"
             fi
@@ -954,7 +974,6 @@ list_all_servers() {
                 if [ -f "$dir/bedrock_server" ]; then
                     if systemctl is-active --quiet "$username.service" 2>/dev/null; then
                         status="${GREEN}● $(t "RUNNING" "BERJALAN")${NC}"
-                        # FIXED: PID detection using pgrep with username
                         local pid=$(pgrep -u "$username" -f "bedrock_server" | head -1)
                         [ -n "$pid" ] && pid_info=" (PID: $pid)" || pid_info=""
                     else
@@ -968,7 +987,6 @@ list_all_servers() {
                 
                 port=$(grep "^server-port=" "$dir/server.properties" 2>/dev/null | cut -d'=' -f2)
                 
-                # Get shell info
                 local user_shell=$(getent passwd "$username" | cut -d: -f7)
                 if [[ "$user_shell" == *"nologin" ]]; then
                     shell_info="(SFTP only)"
@@ -976,7 +994,6 @@ list_all_servers() {
                     shell_info="(shell: $user_shell)"
                 fi
                 
-                # Check tmux session
                 if tmux has-session -t "$username" 2>/dev/null; then
                     tmux_info=" (tmux)"
                 else
