@@ -1,0 +1,1132 @@
+#!/bin/bash
+
+# Minecraft Bedrock Server Auto Installer v5.1 - Enterprise Edition
+# Dengan True Chroot Jail + Uninstaller + Cleanup Menu
+
+# Warna untuk output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Konfigurasi global
+SCRIPT_VERSION="5.1"
+MIN_DISK_SPACE=1024  # MB
+MIN_RAM_PER_SERVER=512  # MB
+SSH_PORT=22
+CHROOT_BASE="/var/chroot"
+
+# Fungsi untuk menampilkan banner
+show_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
+    echo "║         (Enterprise Edition - True Chroot Jail)         ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+# Fungsi untuk logging
+log() {
+    local message=$1
+    local color=${2:-$GREEN}
+    local timestamp=$(date '+%H:%M:%S')
+    echo -e "${color}[$timestamp] $message${NC}"
+}
+
+# Fungsi untuk error handling
+error_exit() {
+    log "❌ $1" "$RED"
+    exit 1
+}
+
+# Fungsi untuk mengecek system resources
+check_resources() {
+    log "Memeriksa resources sistem..." "$YELLOW"
+    
+    # Cek disk space
+    local available_disk=$(df -m /home | awk 'NR==2 {print $4}')
+    if [ "$available_disk" -lt "$MIN_DISK_SPACE" ]; then
+        error_exit "Disk space tidak cukup! Minimal ${MIN_DISK_SPACE}MB, tersedia ${available_disk}MB"
+    fi
+    log "✓ Disk space: ${available_disk}MB tersedia" "$GREEN"
+    
+    # Cek RAM total
+    local total_ram=$(free -m | awk '/Mem:/ {print $2}')
+    log "✓ Total RAM: ${total_ram}MB" "$GREEN"
+    
+    # Cek OS
+    if [ ! -f /etc/debian_version ]; then
+        log "⚠ Script ini dioptimalkan untuk Debian/Ubuntu" "$YELLOW"
+    fi
+}
+
+# Fungsi untuk mengecek dan install dependencies
+check_dependencies() {
+    log "Memeriksa dependencies..." "$YELLOW"
+    
+    local deps=("unzip" "curl" "tmux" "systemctl" "chmod" "lsof" "ufw" "wget" "bc" "openssh-server" "openssl")
+    local install_packages=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v $dep &> /dev/null; then
+            if [[ $dep == "openssh-server" ]]; then
+                if ! systemctl list-unit-files | grep -q ssh; then
+                    install_packages+=($dep)
+                else
+                    log "✓ sshd tersedia" "$GREEN"
+                    continue
+                fi
+            else
+                log "⚠ $dep tidak ditemukan" "$YELLOW"
+                install_packages+=($dep)
+            fi
+        else
+            log "✓ $dep tersedia" "$GREEN"
+        fi
+    done
+    
+    # Install packages jika perlu
+    if [ ${#install_packages[@]} -gt 0 ]; then
+        log "Menginstall: ${install_packages[*]}" "$YELLOW"
+        apt update && apt install -y ${install_packages[*]} || error_exit "Gagal install dependencies"
+        log "✓ Dependencies terinstall" "$GREEN"
+    fi
+}
+
+# Fungsi untuk generate random password
+generate_password() {
+    openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*' | fold -w 16 | head -n 1
+}
+
+# Fungsi untuk setup true chroot jail
+setup_chroot_jail() {
+    local username=$1
+    local server_folder=$2
+    
+    log "Setting up chroot jail for $username..." "$YELLOW"
+    
+    # Create chroot base
+    local chroot_path="$CHROOT_BASE/$username"
+    mkdir -p "$chroot_path"
+    
+    # Create minimal chroot environment
+    mkdir -p "$chroot_path"/{bin,dev,etc,lib,lib64,usr,home,minecraft}
+    
+    # Copy necessary binaries and libraries for SFTP
+    cp /bin/bash "$chroot_path/bin/"
+    cp /usr/lib/openssh/sftp-server "$chroot_path/usr/bin/" 2>/dev/null || \
+    cp /usr/libexec/openssh/sftp-server "$chroot_path/usr/bin/" 2>/dev/null
+    
+    # Copy libraries
+    for lib in ld-linux*.so* libc.so* libnss_compat.so* libnss_files.so* libresolv.so*; do
+        find /lib -name "$lib" -exec cp {} "$chroot_path/lib/" 2>/dev/null \;
+        find /lib64 -name "$lib" -exec cp {} "$chroot_path/lib64/" 2>/dev/null \;
+    done
+    
+    # Copy nsswitch.conf
+    cp /etc/nsswitch.conf "$chroot_path/etc/"
+    
+    # Create passwd and group files for chroot
+    grep "^$username:" /etc/passwd > "$chroot_path/etc/passwd"
+    grep "^sftp-users:" /etc/group > "$chroot_path/etc/group"
+    
+    # Create devices
+    mknod -m 666 "$chroot_path/dev/null" c 1 3 2>/dev/null
+    mknod -m 666 "$chroot_path/dev/zero" c 1 5 2>/dev/null
+    mknod -m 666 "$chroot_path/dev/random" c 1 8 2>/dev/null
+    mknod -m 666 "$chroot_path/dev/urandom" c 1 9 2>/dev/null
+    
+    # Mount server folder to chroot
+    mkdir -p "$chroot_path/minecraft/$server_folder"
+    
+    # Bind mount (persistent)
+    if ! grep -q "$chroot_path/minecraft/$server_folder" /etc/fstab; then
+        echo "/home/minecraft/$server_folder $chroot_path/minecraft/$server_folder none bind 0 0" >> /etc/fstab
+    fi
+    
+    # Mount now
+    mount --bind "/home/minecraft/$server_folder" "$chroot_path/minecraft/$server_folder"
+    
+    # Set permissions
+    chown root:root "$chroot_path"
+    chmod 755 "$chroot_path"
+    chown -R "$username:sftp-users" "$chroot_path/minecraft/$server_folder"
+    
+    log "✓ Chroot jail created at $chroot_path" "$GREEN"
+}
+
+# Fungsi untuk setup user dengan true chroot
+setup_sftp_user() {
+    local username=$1
+    local server_folder=$2
+    local password=$3
+    
+    log "Setting up chrooted SFTP user: $username" "$YELLOW"
+    
+    # Create group if not exists
+    if ! getent group sftp-users >/dev/null; then
+        groupadd sftp-users
+        log "✓ Group sftp-users created" "$GREEN"
+    fi
+    
+    # Create user if not exists
+    if ! id "$username" &>/dev/null; then
+        # Create user with no shell and home in chroot
+        useradd -m -d "/home/$username" -s /usr/sbin/nologin -G sftp-users "$username"
+        
+        # Set password
+        echo "$username:$password" | chpasswd
+        log "✓ User $username created with password: $password" "$GREEN"
+        
+        # Lock the user's home (they will use chroot instead)
+        chmod 750 "/home/$username"
+    else
+        log "⚠ User $username already exists" "$YELLOW"
+        usermod -a -G sftp-users "$username"
+    fi
+    
+    # Setup chroot jail
+    setup_chroot_jail "$username" "$server_folder"
+    
+    # Configure SSH for this specific user
+    local sshd_config="/etc/ssh/sshd_config"
+    
+    # Add user-specific chroot if not exists
+    if ! grep -q "Match User $username" "$sshd_config"; then
+        cat >> "$sshd_config" << EOF
+
+# Chroot jail for $username
+Match User $username
+    ChrootDirectory $CHROOT_BASE/$username
+    ForceCommand internal-sftp
+    PermitTunnel no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PasswordAuthentication yes
+EOF
+        log "✓ SSH chroot configuration added for $username" "$GREEN"
+    fi
+    
+    log "✓ Chroot SFTP setup complete for $username" "$GREEN"
+}
+
+# Fungsi untuk setup user Minecraft (non-jail, untuk run server)
+setup_minecraft_user() {
+    local username=$1
+    local server_folder=$2
+    
+    if ! id "$username" &>/dev/null; then
+        useradd -m -s /bin/bash -d "/home/$username" "$username"
+        log "✓ Minecraft user $username created" "$GREEN"
+    fi
+    
+    # Ensure server folder ownership
+    chown -R "$username:$username" "/home/minecraft/$server_folder"
+}
+
+# Fungsi untuk setup user dengan pilihan password
+setup_user_with_password() {
+    local server_index=$1
+    local server_folder=$2
+    local default_username="mcserver$server_index"
+    
+    echo -e "\n${PURPLE}━━━━━━ User Configuration for Server #$server_index ━━━━━━${NC}"
+    
+    # Username for SFTP
+    log "Username untuk SFTP access (default: $default_username-sftp):" "$BLUE"
+    read -r sftp_username
+    [ -z "$sftp_username" ] && sftp_username="${default_username}-sftp"
+    
+    # Password
+    log "Pilih metode password:" "$BLUE"
+    echo "  1) Generate random password (recommended)"
+    echo "  2) Masukkan password manual"
+    log "Pilihan (default: 1):" "$BLUE"
+    read -r password_choice
+    
+    local sftp_password
+    case $password_choice in
+        2)
+            while true; do
+                log "Masukkan password (min 8 karakter):" "$BLUE"
+                read -s sftp_password
+                echo
+                log "Konfirmasi password:" "$BLUE"
+                read -s sftp_password_confirm
+                echo
+                
+                if [ "$sftp_password" != "$sftp_password_confirm" ]; then
+                    log "❌ Password tidak cocok!" "$RED"
+                elif [ ${#sftp_password} -lt 8 ]; then
+                    log "❌ Password minimal 8 karakter!" "$RED"
+                else
+                    break
+                fi
+            done
+            ;;
+        *)
+            sftp_password=$(generate_password)
+            log "✓ Random password generated" "$GREEN"
+            ;;
+    esac
+    
+    # Save user info
+    sftp_users+=("$sftp_username|$sftp_password|$server_folder")
+    
+    # Create Minecraft user (for running server)
+    setup_minecraft_user "$default_username" "$server_folder"
+    
+    # Setup chroot SFTP user
+    setup_sftp_user "$sftp_username" "$server_folder" "$sftp_password"
+}
+
+# Fungsi untuk validasi port
+validate_port() {
+    local port=$1
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Fungsi untuk cek port availability
+check_port() {
+    local port_var=$1
+    local port_value=$2
+    local server_index=$3
+    
+    if ! validate_port "$port_value"; then
+        log "❌ Port $port_value tidak valid (1024-65535)" "$RED"
+        return 1
+    fi
+    
+    if lsof -i:"$port_value" >/dev/null 2>&1; then
+        log "⚠ Port $port_value sudah dipakai" "$YELLOW"
+        
+        local new_port=$port_value
+        local max_attempts=100
+        local attempt=0
+        
+        while lsof -i:"$new_port" >/dev/null 2>&1 && [ $attempt -lt $max_attempts ]; do
+            new_port=$((new_port + 1))
+            [ $new_port -gt 65535 ] && new_port=1024
+            attempt=$((attempt + 1))
+        done
+        
+        if [ $attempt -eq $max_attempts ]; then
+            log "❌ Tidak ada port kosong" "$RED"
+            return 1
+        fi
+        
+        log "✓ Menggunakan port $new_port" "$GREEN"
+        eval "$port_var=$new_port"
+    else
+        log "✓ Port $port_value tersedia" "$GREEN"
+    fi
+    return 0
+}
+
+# Fungsi untuk sanitasi nama folder
+sanitize_folder_name() {
+    local name=$1
+    echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-'
+}
+
+# Fungsi untuk setup user dan folders
+setup_user_and_folders() {
+    log "Setup user dan folder..." "$YELLOW"
+    
+    while true; do
+        log "Masukkan jumlah server (1-10):" "$BLUE"
+        read -r jumlah_server
+        if [[ "$jumlah_server" =~ ^[0-9]+$ ]] && [ "$jumlah_server" -ge 1 ] && [ "$jumlah_server" -le 10 ]; then
+            break
+        else
+            log "⚠ Masukkan angka 1-10" "$YELLOW"
+        fi
+    done
+    
+    local total_ram=$(free -m | awk '/Mem:/ {print $2}')
+    local min_ram_needed=$((jumlah_server * MIN_RAM_PER_SERVER))
+    if [ "$total_ram" -lt "$min_ram_needed" ]; then
+        log "⚠ RAM mungkin tidak cukup: ${total_ram}MB total, minimal ${min_ram_needed}MB untuk $jumlah_server server" "$YELLOW"
+        log "Lanjutkan? [y/N]" "$BLUE"
+        read -r continue_anyway
+        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+            exit 0
+        fi
+    fi
+    
+    mkdir -p /home/minecraft
+    mkdir -p "$CHROOT_BASE"
+    log "✓ Folder structure ready" "$GREEN"
+}
+
+# Fungsi untuk input konfigurasi server
+get_server_config() {
+    local server_index=$1
+    
+    echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    log "Konfigurasi Server #$server_index" "$PURPLE"
+    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    log "Nama server (default: Server$server_index):" "$BLUE"
+    read -r server_name
+    [ -z "$server_name" ] && server_name="Server$server_index"
+    
+    folder_name=$(sanitize_folder_name "$server_name")
+    [ -z "$folder_name" ] && folder_name="server$server_index"
+    
+    if [ -d "/home/minecraft/$folder_name" ]; then
+        log "⚠ Folder /home/minecraft/$folder_name sudah ada" "$YELLOW"
+        log "Pilih: [1] overwrite [2] rename [3] skip" "$BLUE"
+        read -r choice
+        case $choice in
+            1)
+                log "Overwrite folder..." "$YELLOW"
+                rm -rf "/home/minecraft/$folder_name"
+                ;;
+            2)
+                log "Nama folder baru:" "$BLUE"
+                read -r folder_name
+                folder_name=$(sanitize_folder_name "$folder_name")
+                [ -z "$folder_name" ] && folder_name="server$server_index-alt"
+                ;;
+            3)
+                return 1
+                ;;
+            *)
+                log "Pilihan tidak valid, skip" "$RED"
+                return 1
+                ;;
+        esac
+    fi
+    
+    log "Nama world (default: $folder_name):" "$BLUE"
+    read -r level_name
+    [ -z "$level_name" ] && level_name="$folder_name"
+    
+    log "Seed (kosongkan untuk random):" "$BLUE"
+    read -r level_seed
+    
+    local default_port=$((19132 + server_index - 1))
+    while true; do
+        log "Port server (default: $default_port):" "$BLUE"
+        read -r server_port
+        [ -z "$server_port" ] && server_port=$default_port
+        
+        if validate_port "$server_port"; then
+            break
+        else
+            log "⚠ Port harus 1024-65535" "$YELLOW"
+        fi
+    done
+    
+    check_port server_port "$server_port" $server_index || return 1
+    
+    local server_portv6=$((server_port + 1))
+    
+    log "Pilih gamemode:" "$BLUE"
+    echo "  0) survival"
+    echo "  1) creative"
+    echo "  2) adventure"
+    log "Pilihan (default: 0):" "$BLUE"
+    read -r gamemode_choice
+    case $gamemode_choice in
+        1) gamemode="creative" ;;
+        2) gamemode="adventure" ;;
+        *) gamemode="survival" ;;
+    esac
+    
+    log "Pilih difficulty:" "$BLUE"
+    echo "  0) peaceful"
+    echo "  1) easy"
+    echo "  2) normal"
+    echo "  3) hard"
+    log "Pilihan (default: 2):" "$BLUE"
+    read -r difficulty_choice
+    case $difficulty_choice in
+        0) difficulty="peaceful" ;;
+        1) difficulty="easy" ;;
+        3) difficulty="hard" ;;
+        *) difficulty="normal" ;;
+    esac
+    
+    log "Aktifkan cheats? [0] false [1] true (default: 0):" "$BLUE"
+    read -r cheats_choice
+    allow_cheats=$([ "$cheats_choice" == "1" ] && echo "true" || echo "false")
+    
+    if command -v ufw &> /dev/null; then
+        if ufw status | grep -q "Status: active"; then
+            ufw allow "$server_port/udp" 2>/dev/null
+            log "✓ Firewall port $server_port/udp dibuka" "$GREEN"
+        fi
+    fi
+    
+    server_configs+=("$server_name|$folder_name|$level_name|$level_seed|$server_port|$server_portv6|$gamemode|$difficulty|$allow_cheats")
+    
+    return 0
+}
+
+# Fungsi untuk memilih versi server
+select_version() {
+    log "Memilih versi server..." "$YELLOW"
+    
+    while true; do
+        log "Masukkan versi (contoh: 1.21.114.1) atau 'latest':" "$BLUE"
+        read -r version
+        
+        if [ "$version" == "latest" ]; then
+            log "Mencari versi terbaru..." "$YELLOW"
+            
+            latest_url=$(curl -A "Mozilla/5.0" -s "https://net-secondary.web.minecraft-services.net/api/v1.0/download/links" | 
+                        grep -o '"downloadUrl":"[^"]*serverBedrockLinux[^"]*"' | 
+                        head -1 | 
+                        cut -d'"' -f4)
+            
+            if [ -n "$latest_url" ]; then
+                version=$(echo "$latest_url" | grep -o 'bedrock-server-[0-9.]*\.zip' | sed 's/bedrock-server-//;s/\.zip//')
+                log "✓ Versi terbaru: $version" "$GREEN"
+                download_url="$latest_url"
+                break
+            else
+                log "❌ Gagal dapat versi terbaru" "$RED"
+                continue
+            fi
+        else
+            download_url="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-$version.zip"
+        fi
+        
+        log "Memeriksa versi $version..." "$YELLOW"
+        
+        if curl -A "Mozilla/5.0" --output /dev/null --silent --head --fail --connect-timeout 10 "$download_url"; then
+            log "✓ Versi $version tersedia" "$GREEN"
+            break
+        else
+            log "❌ Versi $version tidak ditemukan" "$RED"
+        fi
+    done
+    
+    DOWNLOAD_URL=$download_url
+}
+
+# Fungsi untuk download dan setup server
+setup_server() {
+    local config=$1
+    IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
+    
+    log "Setup server: $server_name" "$YELLOW"
+    
+    cd /home/minecraft || error_exit "Cannot cd to /home/minecraft"
+    
+    mkdir -p "$folder_name"
+    cd "$folder_name" || error_exit "Cannot cd to $folder_name"
+    
+    [ -f "server.properties" ] && cp "server.properties" "server.properties.backup.$(date +%Y%m%d-%H%M%S)"
+    
+    if [ ! -f "bedrock_server" ]; then
+        log "Download server files..." "$YELLOW"
+        
+        local max_retries=3
+        local retry=0
+        while [ $retry -lt $max_retries ]; do
+            wget --user-agent="Mozilla/5.0" \
+                 -O bedrock-server.zip \
+                 --timeout=30 \
+                 --tries=3 \
+                 "$DOWNLOAD_URL" && break
+            
+            retry=$((retry + 1))
+            [ $retry -lt $max_retries ] && log "Retry $retry/$max_retries..." "$YELLOW"
+        done
+        
+        if [ ! -f "bedrock-server.zip" ]; then
+            log "❌ Download gagal setelah $max_retries percobaan" "$RED"
+            return 1
+        fi
+        
+        local file_size=$(stat -c%s "bedrock-server.zip" 2>/dev/null || stat -f%z "bedrock-server.zip" 2>/dev/null)
+        if [ -z "$file_size" ] || [ "$file_size" -lt 50000000 ]; then
+            log "❌ File corrupted (size: $file_size bytes)" "$RED"
+            rm -f "bedrock-server.zip"
+            return 1
+        fi
+        
+        log "Extracting..." "$YELLOW"
+        unzip -o bedrock-server.zip || {
+            log "❌ Extract failed" "$RED"
+            return 1
+        }
+        rm bedrock-server.zip
+    else
+        log "✓ Server files already exist" "$GREEN"
+    fi
+    
+    chmod +x bedrock_server
+    
+    log "Creating server.properties..." "$YELLOW"
+    cat > server.properties << EOF
+# Minecraft Bedrock Server Properties
+server-name=$server_name
+gamemode=$gamemode
+force-gamemode=false
+difficulty=$difficulty
+allow-cheats=$allow_cheats
+max-players=99999
+online-mode=true
+allow-list=false
+server-port=$server_port
+server-portv6=$server_portv6
+enable-lan-visibility=true
+view-distance=10
+tick-distance=4
+player-idle-timeout=120
+max-threads=8
+level-name=$level_name
+level-seed=$level_seed
+default-player-permission-level=member
+texturepack-required=false
+content-log-file-enabled=false
+compression-threshold=1
+compression-algorithm=zlib
+EOF
+    
+    log "✓ Server $server_name siap" "$GREEN"
+    return 0
+}
+
+# Fungsi untuk membuat systemd service
+create_systemd() {
+    local config=$1
+    IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
+    
+    log "Membuat systemd service untuk $server_name..." "$YELLOW"
+    
+    local service_name="$folder_name.service"
+    local service_file="/etc/systemd/system/$service_name"
+    local username="mcserver$(echo $folder_name | tr -cd '0-9')"
+    [ -z "$username" ] && username="mcserver1"
+    
+    local total_ram=$(free -m | awk '/Mem:/ {print $2}')
+    local ram_per_server=$((total_ram / jumlah_server))
+    [ $ram_per_server -gt 2048 ] && ram_per_server=2048
+    
+    cat > "$service_file" << EOF
+[Unit]
+Description=Minecraft Bedrock Server - $server_name
+After=network.target
+StartLimitInterval=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=$username
+Group=$username
+WorkingDirectory=/home/minecraft/$folder_name
+ExecStart=/home/minecraft/$folder_name/bedrock_server
+ExecStop=/bin/kill -TERM \$MAINPID
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
+RestartSec=5
+Nice=10
+CPUQuota=80%
+MemoryLimit=${ram_per_server}M
+LimitNOFILE=65535
+StandardOutput=append:/home/minecraft/$folder_name/server.log
+StandardError=append:/home/minecraft/$folder_name/error.log
+SuccessExitStatus=0 1
+RestartPreventExitStatus=255
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    log "✓ Service $service_name dibuat" "$GREEN"
+}
+
+# Fungsi untuk enable service
+enable_service() {
+    local config=$1
+    IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
+    
+    local service_name="$folder_name.service"
+    
+    log "Enable service $service_name..." "$YELLOW"
+    systemctl daemon-reload
+    systemctl enable "$service_name" || log "❌ Gagal enable service" "$RED"
+    log "✓ Service enabled" "$GREEN"
+}
+
+# Fungsi untuk start semua server dengan delay
+start_all_servers() {
+    log "Starting all servers..." "$YELLOW"
+    
+    local index=1
+    for config in "${server_configs[@]}"; do
+        IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
+        
+        log "Starting $server_name (port $server_port)..." "$YELLOW"
+        systemctl start "$folder_name.service"
+        
+        sleep 2
+        if systemctl is-active --quiet "$folder_name.service"; then
+            log "✓ $server_name running" "$GREEN"
+        else
+            log "❌ $server_name failed to start" "$RED"
+            journalctl -u "$folder_name.service" --no-pager -n 5
+        fi
+        
+        if [ $index -lt ${#server_configs[@]} ]; then
+            log "Waiting 5 seconds..." "$YELLOW"
+            sleep 5
+        fi
+        
+        ((index++))
+    done
+}
+
+# Fungsi untuk cleanup semua file Minecraft
+cleanup_all() {
+    echo -e "\n${RED}══════════════════════════════════════════════════════════${NC}"
+    log "CLEANUP MENU - DESTRUCTIVE ACTION" "$RED"
+    echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
+    
+    echo "1) Clean specific server"
+    echo "2) Clean ALL servers and users"
+    echo "3) Clean orphaned users (no server)"
+    echo "4) Clean SSH jail configurations"
+    echo "5) Back to main menu"
+    
+    log "Pilihan (1-5):" "$BLUE"
+    read -r cleanup_choice
+    
+    case $cleanup_choice in
+        1) cleanup_specific_server ;;
+        2) cleanup_all_servers ;;
+        3) cleanup_orphaned_users ;;
+        4) cleanup_ssh_jail ;;
+        5) show_main_menu ;;
+        *) log "Pilihan tidak valid!" "$RED"; cleanup_all ;;
+    esac
+}
+
+# Fungsi untuk cleanup server spesifik
+cleanup_specific_server() {
+    echo -e "\n${YELLOW}Available servers:${NC}"
+    local servers=()
+    local i=1
+    
+    for dir in /home/minecraft/*; do
+        if [ -d "$dir" ]; then
+            server_name=$(basename "$dir")
+            servers+=("$server_name")
+            echo "  $i) $server_name"
+            ((i++))
+        fi
+    done
+    
+    if [ ${#servers[@]} -eq 0 ]; then
+        log "❌ No servers found" "$RED"
+        sleep 2
+        cleanup_all
+        return
+    fi
+    
+    echo
+    log "Pilih server yang akan di-clean (nomor):" "$BLUE"
+    read -r server_choice
+    
+    if ! [[ "$server_choice" =~ ^[0-9]+$ ]] || [ "$server_choice" -lt 1 ] || [ "$server_choice" -gt ${#servers[@]} ]; then
+        log "❌ Pilihan tidak valid" "$RED"
+        cleanup_all
+        return
+    fi
+    
+    local selected_server="${servers[$((server_choice-1))]}"
+    
+    echo
+    log "⚠⚠⚠ PERINGATAN! ⚠⚠⚠" "$RED"
+    log "Anda akan menghapus server: $selected_server" "$RED"
+    log "Ketik 'DELETE' untuk konfirmasi:" "$BLUE"
+    read -r confirmation
+    
+    if [ "$confirmation" != "DELETE" ]; then
+        log "❌ Cleanup dibatalkan" "$YELLOW"
+        cleanup_all
+        return
+    fi
+    
+    # Stop and disable service
+    systemctl stop "$selected_server.service" 2>/dev/null
+    systemctl disable "$selected_server.service" 2>/dev/null
+    rm -f "/etc/systemd/system/$selected_server.service"
+    
+    # Remove from fstab
+    sed -i "\|/home/minecraft/$selected_server|d" /etc/fstab
+    
+    # Find and remove related users
+    for user in $(getent passwd | grep -E "mcserver[0-9]+" | cut -d: -f1); do
+        if [ -d "/home/minecraft/$selected_server" ] && [ "$(stat -c '%U' "/home/minecraft/$selected_server" 2>/dev/null)" == "$user" ]; then
+            userdel -r "$user" 2>/dev/null
+            log "✓ Removed user $user" "$GREEN"
+        fi
+    done
+    
+    # Remove SFTP users and chroot
+    for user in $(getent passwd | grep -E ".*-sftp" | cut -d: -f1); do
+        if [ -d "$CHROOT_BASE/$user" ]; then
+            # Unmount
+            umount "$CHROOT_BASE/$user/minecraft/$selected_server" 2>/dev/null
+            # Remove from fstab
+            sed -i "\|$CHROOT_BASE/$user|d" /etc/fstab
+            # Remove chroot
+            rm -rf "$CHROOT_BASE/$user"
+            # Remove user
+            userdel -r "$user" 2>/dev/null
+            log "✓ Removed SFTP user $user" "$GREEN"
+            
+            # Remove SSH config for this user
+            sed -i "/Match User $user/,/PasswordAuthentication yes/d" /etc/ssh/sshd_config
+        fi
+    done
+    
+    # Remove server folder
+    rm -rf "/home/minecraft/$selected_server"
+    
+    systemctl daemon-reload
+    systemctl restart sshd
+    
+    log "✓ Server $selected_server cleaned up!" "$GREEN"
+    sleep 2
+    cleanup_all
+}
+
+# Fungsi untuk cleanup semua server
+cleanup_all_servers() {
+    echo -e "\n${RED}⚠⚠⚠ FINAL WARNING! ⚠⚠⚠${NC}"
+    log "Ini akan menghapus SEMUA server, users, dan konfigurasi!" "$RED"
+    log "Ketik 'DELETE ALL' untuk konfirmasi:" "$BLUE"
+    read -r confirmation
+    
+    if [ "$confirmation" != "DELETE ALL" ]; then
+        log "❌ Cleanup dibatalkan" "$YELLOW"
+        cleanup_all
+        return
+    fi
+    
+    # Stop all services
+    for service in /etc/systemd/system/*.service; do
+        if grep -q "Minecraft Bedrock" "$service" 2>/dev/null; then
+            service_name=$(basename "$service")
+            systemctl stop "$service_name"
+            systemctl disable "$service_name"
+            rm -f "$service"
+        fi
+    done
+    
+    # Remove all users (mcserver* and *-sftp)
+    for user in $(getent passwd | grep -E "(mcserver[0-9]+|.*-sftp)" | cut -d: -f1); do
+        userdel -r "$user" 2>/dev/null
+        log "✓ Removed user $user" "$GREEN"
+    done
+    
+    # Remove all chroot jails
+    rm -rf "$CHROOT_BASE"/*
+    
+    # Remove all server folders
+    rm -rf /home/minecraft/*
+    
+    # Clean fstab
+    sed -i "\|/home/minecraft|d" /etc/fstab
+    sed -i "\|$CHROOT_BASE|d" /etc/fstab
+    
+    # Clean SSH config
+    sed -i '/# Chroot jail for/,/PasswordAuthentication yes/d' /etc/ssh/sshd_config
+    
+    systemctl daemon-reload
+    systemctl restart sshd
+    
+    log "✓ All servers and users have been removed!" "$GREEN"
+    sleep 2
+    show_main_menu
+}
+
+# Fungsi untuk cleanup orphaned users
+cleanup_orphaned_users() {
+    log "Looking for orphaned users..." "$YELLOW"
+    
+    local found=0
+    for user in $(getent passwd | grep -E "(mcserver[0-9]+|.*-sftp)" | cut -d: -f1); do
+        local has_server=0
+        
+        # Check if user owns any server folder
+        for server in /home/minecraft/*; do
+            if [ -d "$server" ] && [ "$(stat -c '%U' "$server" 2>/dev/null)" == "$user" ]; then
+                has_server=1
+                break
+            fi
+        done
+        
+        # Check if user has chroot with mounted server
+        if [ -d "$CHROOT_BASE/$user" ]; then
+            if mount | grep -q "$CHROOT_BASE/$user"; then
+                has_server=1
+            fi
+        fi
+        
+        if [ $has_server -eq 0 ]; then
+            log "Found orphaned user: $user" "$YELLOW"
+            userdel -r "$user" 2>/dev/null
+            rm -rf "$CHROOT_BASE/$user"
+            log "✓ Removed orphaned user $user" "$GREEN"
+            found=1
+        fi
+    done
+    
+    if [ $found -eq 0 ]; then
+        log "✓ No orphaned users found" "$GREEN"
+    fi
+    
+    sleep 2
+    cleanup_all
+}
+
+# Fungsi untuk cleanup SSH jail config
+cleanup_ssh_jail() {
+    log "Cleaning SSH jail configurations..." "$YELLOW"
+    
+    # Remove all chroot configs
+    sed -i '/# Chroot jail for/,/PasswordAuthentication yes/d' /etc/ssh/sshd_config
+    
+    # Remove sftp-users group if empty
+    if getent group sftp-users >/dev/null; then
+        if [ -z "$(getent group sftp-users | cut -d: -f4)" ]; then
+            groupdel sftp-users
+            log "✓ Removed empty sftp-users group" "$GREEN"
+        fi
+    fi
+    
+    systemctl restart sshd
+    log "✓ SSH jail configurations cleaned" "$GREEN"
+    
+    sleep 2
+    cleanup_all
+}
+
+# Fungsi untuk uninstall server (menu option 2)
+uninstall_server() {
+    cleanup_specific_server
+}
+
+# Fungsi untuk list semua server
+list_all_servers() {
+    echo -e "\n${CYAN}══════════════════════════════════════════════════════════${NC}"
+    log "ALL SERVERS" "$PURPLE"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    
+    local found=0
+    for dir in /home/minecraft/*; do
+        if [ -d "$dir" ]; then
+            server_name=$(basename "$dir")
+            found=1
+            
+            if [ -f "$dir/bedrock_server" ]; then
+                if systemctl is-active --quiet "$server_name.service" 2>/dev/null; then
+                    status="${GREEN}● RUNNING${NC}"
+                else
+                    status="${RED}○ STOPPED${NC}"
+                fi
+            else
+                status="${YELLOW}○ INCOMPLETE${NC}"
+            fi
+            
+            port=$(grep "^server-port=" "$dir/server.properties" 2>/dev/null | cut -d'=' -f2)
+            owner=$(stat -c '%U' "$dir" 2>/dev/null)
+            
+            # Find SFTP users accessing this server
+            sftp_users=""
+            for user in $(getent passwd | grep -E ".*-sftp" | cut -d: -f1); do
+                if [ -d "$CHROOT_BASE/$user/minecraft/$server_name" ]; then
+                    sftp_users+="$user, "
+                fi
+            done
+            sftp_users=${sftp_users%, }
+            [ -z "$sftp_users" ] && sftp_users="none"
+            
+            echo -e "\n${PURPLE}📁 $server_name${NC}"
+            echo -e "  Status  : $status"
+            echo -e "  Port    : ${port:-N/A}"
+            echo -e "  Owner   : $owner"
+            echo -e "  SFTP    : $sftp_users"
+            echo -e "  Path    : $dir"
+        fi
+    done
+    
+    if [ $found -eq 0 ]; then
+        log "❌ No Minecraft servers found" "$YELLOW"
+    fi
+    
+    echo
+    log "Press Enter to continue..." "$BLUE"
+    read -r
+    show_main_menu
+}
+
+# Fungsi untuk list SFTP users
+list_sftp_users() {
+    echo -e "\n${CYAN}══════════════════════════════════════════════════════════${NC}"
+    log "SFTP USERS (Chroot Jail)" "$PURPLE"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    
+    local found=0
+    while IFS=: read -r username _ uid gid desc home shell; do
+        if [[ "$username" == *-sftp ]] || [ -d "$CHROOT_BASE/$username" ]; then
+            found=1
+            
+            # Get chroot info
+            if [ -d "$CHROOT_BASE/$username" ]; then
+                chroot_path="$CHROOT_BASE/$username"
+                # Find which server they can access
+                server_access=$(ls "$chroot_path/minecraft/" 2>/dev/null | head -1)
+                [ -z "$server_access" ] && server_access="none"
+                
+                echo -e "\n${PURPLE}👤 $username${NC}"
+                echo -e "  UID      : $uid"
+                echo -e "  Server   : $server_access"
+                echo -e "  Chroot   : $chroot_path"
+                echo -e "  Jail Root: / (cannot go up)"
+                echo -e "  Access   : /minecraft/$server_access/"
+            fi
+        fi
+    done < /etc/passwd
+    
+    if [ $found -eq 0 ]; then
+        log "❌ No SFTP users found" "$YELLOW"
+    fi
+    
+    echo
+    log "Press Enter to continue..." "$BLUE"
+    read -r
+    show_main_menu
+}
+
+# Fungsi untuk menampilkan menu utama
+show_main_menu() {
+    show_banner
+    
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    log "MAIN MENU" "$PURPLE"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    echo "  1) Install new Minecraft server(s)"
+    echo "  2) Uninstall existing server"
+    echo "  3) List all servers"
+    echo "  4) Show SFTP users"
+    echo "  5) Cleanup menu"
+    echo "  6) Exit"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    log "Pilihan (1-6):" "$BLUE"
+    read -r menu_choice
+    
+    case $menu_choice in
+        1) install_new_servers ;;
+        2) uninstall_server ;;
+        3) list_all_servers ;;
+        4) list_sftp_users ;;
+        5) cleanup_all ;;
+        6) exit 0 ;;
+        *) log "Pilihan tidak valid!" "$RED"; sleep 2; show_main_menu ;;
+    esac
+}
+
+# Fungsi untuk install new servers
+install_new_servers() {
+    log "Starting new server installation..." "$YELLOW"
+    
+    check_resources
+    check_dependencies
+    
+    # Initialize arrays
+    declare -a server_configs=()
+    declare -a sftp_users=()
+    
+    setup_user_and_folders
+    
+    for i in $(seq 1 $jumlah_server); do
+        if get_server_config $i; then
+            setup_user_with_password $i "$folder_name"
+        fi
+    done
+    
+    [ ${#server_configs[@]} -eq 0 ] && error_exit "Tidak ada server yang dikonfigurasi"
+    
+    select_version
+    
+    local success_count=0
+    for config in "${server_configs[@]}"; do
+        if setup_server "$config"; then
+            ((success_count++))
+        fi
+    done
+    
+    [ $success_count -eq 0 ] && error_exit "Tidak ada server yang berhasil diinstall"
+    
+    for config in "${server_configs[@]}"; do
+        create_systemd "$config"
+    done
+    
+    for config in "${server_configs[@]}"; do
+        enable_service "$config"
+    done
+    
+    # Display credentials
+    echo -e "\n${GREEN}══════════════════════════════════════════════════════════${NC}"
+    log "SFTP ACCESS CREDENTIALS" "$PURPLE"
+    echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
+    
+    local ip_address=$(hostname -I | awk '{print $1}')
+    for user_info in "${sftp_users[@]}"; do
+        IFS='|' read -r username password server_folder <<< "$user_info"
+        
+        echo -e "\n${CYAN}Server: $server_folder${NC}"
+        echo -e "  Username : $username"
+        echo -e "  Password : ${YELLOW}$password${NC}"
+        echo -e "  Command  : sftp $username@$ip_address"
+        echo -e "  Jail Root: / (cannot go up)"
+        echo -e "  Access   : /minecraft/$server_folder/"
+    done
+    
+    echo -e "\n${RED}⚠ IMPORTANT: Save these passwords! They won't be shown again.${NC}"
+    
+    log "\nStart semua server sekarang? [y/N]" "$BLUE"
+    read -r start_now
+    if [[ "$start_now" =~ ^[Yy]$ ]]; then
+        start_all_servers
+    fi
+    
+    log "\nTekan Enter untuk kembali ke menu..." "$GREEN"
+    read -r
+    show_main_menu
+}
+
+# Trap for cleanup
+trap 'log "Script interrupted!" "$RED"; exit 1' INT TERM
+
+# Fungsi utama
+main() {
+    show_banner
+    
+    if [ "$EUID" -ne 0 ]; then 
+        error_exit "Script harus dijalankan sebagai root"
+    fi
+    
+    show_main_menu
+}
+
+# Run main
+main
