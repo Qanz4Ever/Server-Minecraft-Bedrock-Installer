@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Auto Installer v5.9 - Enterprise Edition
-# Fixed user shell + MemoryMax + Direct service execution
+# Minecraft Bedrock Server Auto Installer v6.0 - Enterprise Edition
+# Complete SFTP Jail with Restricted Shell
 
 # Warna untuk output
 RED='\033[0;31m'
@@ -14,11 +14,12 @@ WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Konfigurasi global
-SCRIPT_VERSION="5.9"
+SCRIPT_VERSION="6.0"
 MIN_DISK_SPACE=1024  # MB
 MIN_RAM_PER_SERVER=512  # MB
 SSH_PORT=22
 BASE_PATH="/home/minecraft"
+JAIL_BASE="/var/chroot"
 
 # Language variables
 LANG_EN=0
@@ -31,7 +32,7 @@ clear_screen() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - Stable Service)           ║"
+    echo "║         (Enterprise Edition - Complete Jail)            ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -159,36 +160,38 @@ check_dependencies() {
         info "$(t "Generating SSH host keys..." "Membuat SSH host keys...")"
         dpkg-reconfigure openssh-server
     fi
-    
-    configure_ssh
 }
 
-# Fungsi untuk configure SSH
+# Fungsi untuk configure SSH dengan chroot jail
 configure_ssh() {
-    info "$(t "Configuring SSH for proper SFTP/SSH access..." "Mengkonfigurasi SSH untuk akses SFTP/SSH...")"
+    info "$(t "Configuring SSH with chroot jail support..." "Mengkonfigurasi SSH dengan dukungan chroot jail...")"
     
     local sshd_config="/etc/ssh/sshd_config"
     local backup="/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
     
     # Backup
     cp "$sshd_config" "$backup"
+    success "$(t "SSH config backed up" "Konfigurasi SSH dibackup")"
     
     # Ensure password authentication is enabled
     sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_config"
     sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_config"
     
-    # Disable root login
-    sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
-    sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
+    # Disable root login (optional - root still can login via console)
+    sed -i 's/^#PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
     
-    # Enable SFTP internal subsystem
+    # Enable internal-sftp subsystem
     if ! grep -q "^Subsystem sftp" "$sshd_config"; then
         echo "Subsystem sftp internal-sftp" >> "$sshd_config"
     else
         sed -i 's/^Subsystem sftp.*/Subsystem sftp internal-sftp/' "$sshd_config"
     fi
     
-    # Restart SSH service (handles both ssh and sshd)
+    # Remove any existing Match blocks for mcserver users
+    sed -i '/# Minecraft user configurations/,/^$/d' "$sshd_config"
+    
+    success "$(t "SSH base configuration completed" "Konfigurasi dasar SSH selesai")"
     restart_ssh_service
 }
 
@@ -201,33 +204,17 @@ restart_ssh_service() {
     
     for service in "${ssh_services[@]}"; do
         if systemctl list-units --full -all | grep -q "$service.service"; then
-            info "$(t "Found" "Ditemukan") $service.service, $(t "restarting..." "merestart...")"
             systemctl restart "$service"
             if [ $? -eq 0 ]; then
-                success "$service.service $(t "restarted successfully" "berhasil direstart")"
+                success "$service.service $(t "restarted" "direstart")"
                 restarted=1
                 break
-            else
-                warning "$(t "Failed to restart" "Gagal merestart") $service.service"
             fi
         fi
     done
     
     if [ $restarted -eq 0 ]; then
-        warning "$(t "No SSH service found. Trying to start ssh service..." "Tidak ada service SSH ditemukan. Mencoba memulai service ssh...")"
-        systemctl start ssh 2>/dev/null || systemctl start sshd 2>/dev/null
-        
-        for service in "${ssh_services[@]}"; do
-            if systemctl is-active --quiet "$service" 2>/dev/null; then
-                success "$service.service $(t "started" "dimulai")"
-                restarted=1
-                break
-            fi
-        done
-        
-        if [ $restarted -eq 0 ]; then
-            error "$(t "Could not start any SSH service" "Tidak dapat memulai service SSH apapun")"
-        fi
+        warning "$(t "Could not restart SSH service" "Tidak dapat merestart service SSH")"
     fi
 }
 
@@ -236,59 +223,186 @@ generate_password() {
     openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*' | fold -w 16 | head -n 1
 }
 
-# Fungsi untuk setup user dengan akses SSH/SFTP yang benar - FIXED: using bash shell
+# FUNGSI UTAMA: Setup Minecraft user dengan chroot jail yang benar
 setup_minecraft_user() {
     local username=$1
     local password=$2
     local server_path="$BASE_PATH/$username"
+    local jail_path="$JAIL_BASE/$username"
     
-    info "$(t "Setting up user:" "Membuat user:") $username"
+    info "$(t "Setting up chroot jail for user:" "Membuat chroot jail untuk user:") $username"
     
-    # Create user if not exists - FIXED: using bash shell for proper service execution
+    # --- CREATE USER WITH BASH SHELL (REQUIRED FOR SYSTEMD) ---
     if ! id "$username" &>/dev/null; then
-        # Using bash shell for service execution
         useradd -m -d "/home/$username" -s /bin/bash "$username"
-        success "$(t "User" "User") $username $(t "created with bash shell" "dibuat dengan shell bash")"
+        success "$(t "User created with bash shell" "User dibuat dengan shell bash")"
     else
-        warning "$(t "User" "User") $username $(t "already exists" "sudah ada")"
-        # Ensure bash shell
-        usermod -s /bin/bash "$username"
-        pkill -u "$username" 2>/dev/null
+        warning "$(t "User already exists" "User sudah ada")"
+        usermod -s /bin/bash "$username"  # Ensure bash shell
     fi
     
-    # Set password
+    # --- SET PASSWORD ---
     echo "$username:$password" | chpasswd
-    success "$(t "Password set for" "Password diatur untuk") $username"
+    success "$(t "Password set" "Password diatur")"
     
-    # Create .ssh directory
-    mkdir -p "/home/$username/.ssh"
-    chmod 700 "/home/$username/.ssh"
-    chown "$username:$username" "/home/$username/.ssh"
-    
-    # Create the server directory
+    # --- CREATE SERVER DIRECTORY ---
     mkdir -p "$server_path"
-    
-    # Set proper ownership
     chown -R "$username:$username" "$server_path"
     chmod 755 "$server_path"
-    chown "$username:$username" "/home/$username"
-    chmod 755 "/home/$username"
     
-    # Create .bashrc
-    cat > "/home/$username/.bashrc" << 'EOF'
-# Simple prompt
-PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\W\[\e[0m\]\$ '
+    # --- CREATE CHROOT JAIL STRUCTURE ---
+    # Critical: For chroot to work, the jail root must be owned by root
+    mkdir -p "$jail_path"
+    chown root:root "$jail_path"
+    chmod 755 "$jail_path"
+    
+    # Create necessary directories inside jail
+    mkdir -p "$jail_path"/{dev,etc,lib,lib64,usr,bin,home,minecraft}
+    
+    # Create minimal device files
+    mknod -m 666 "$jail_path/dev/null" c 1 3 2>/dev/null
+    mknod -m 666 "$jail_path/dev/zero" c 1 5 2>/dev/null
+    mknod -m 666 "$jail_path/dev/random" c 1 8 2>/dev/null
+    mknod -m 666 "$jail_path/dev/urandom" c 1 9 2>/dev/null
+    
+    # Copy basic system files
+    cp /etc/ld.so.cache "$jail_path/etc/" 2>/dev/null
+    cp /etc/ld.so.conf "$jail_path/etc/" 2>/dev/null
+    cp /etc/nsswitch.conf "$jail_path/etc/" 2>/dev/null
+    cp /etc/hosts "$jail_path/etc/" 2>/dev/null
+    cp /etc/resolv.conf "$jail_path/etc/" 2>/dev/null
+    
+    # Copy necessary libraries
+    for lib in ld-linux*.so* libc.so* libpthread.so* libdl.so* libutil.so* \
+               libm.so* libresolv.so* libnss_files.so* libnss_compat.so*; do
+        find /lib -name "$lib" -exec cp {} "$jail_path/lib/" 2>/dev/null \;
+        find /lib64 -name "$lib" -exec cp {} "$jail_path/lib64/" 2>/dev/null \;
+    done
+    
+    # Copy basic binaries for restricted shell
+    cp /bin/bash "$jail_path/bin/"
+    cp /bin/ls "$jail_path/bin/"
+    cp /bin/cat "$jail_path/bin/"
+    cp /bin/echo "$jail_path/bin/"
+    cp /bin/pwd "$jail_path/bin/"
+    cp /bin/clear "$jail_path/bin/"
+    
+    # --- BIND MOUNT SERVER FOLDER INTO JAIL ---
+    mkdir -p "$jail_path/minecraft/$username"
+    
+    # Add to fstab for persistence
+    if ! grep -q "$jail_path/minecraft/$username" /etc/fstab; then
+        echo "$server_path $jail_path/minecraft/$username none bind 0 0" >> /etc/fstab
+    fi
+    
+    # Mount it
+    mount --bind "$server_path" "$jail_path/minecraft/$username" 2>/dev/null
+    
+    # Create symlink in user's home inside jail
+    mkdir -p "$jail_path/home/$username"
+    ln -sf "/minecraft/$username" "$jail_path/home/$username/server"
+    
+    # Set ownership of the mounted directory
+    chown "$username:$username" "$jail_path/minecraft/$username"
+    
+    # --- CREATE RESTRICTED .BASHRC INSIDE JAIL ---
+    mkdir -p "$jail_path/home/$username"
+    cat > "$jail_path/home/$username/.bashrc" << 'EOF'
+# Restricted .bashrc for jailed environment
+cd /minecraft/$USER
 
-# Aliases
+# Simple prompt showing jail status
+PS1='\[\e[1;33m\][JAIL]\[\e[0m\] \u@\h:\w\$ '
+
+# Aliases for basic commands
 alias ll='ls -la'
 alias la='ls -a'
 alias l='ls -CF'
 
-echo "Welcome to Minecraft Server"
+# Block dangerous commands
+alias sudo='echo "Command not allowed in jail"'
+alias apt='echo "Command not allowed in jail"'
+alias systemctl='echo "Command not allowed in jail"'
+alias service='echo "Command not allowed in jail"'
+alias dpkg='echo "Command not allowed in jail"'
+alias passwd='echo "Use root to change password"'
+
+# Welcome message
+echo "=================================================="
+echo "  Minecraft Server Jail - $USER"
+echo "  You are in your server directory"
+echo "  Available commands: ls, cat, echo, cd, pwd"
+echo "=================================================="
+ls -F --color=auto
 EOF
-    chown "$username:$username" "/home/$username/.bashrc"
     
-    success "$(t "User" "User") $username $(t "setup complete" "setup selesai")"
+    chown "$username:$username" "$jail_path/home/$username/.bashrc"
+    
+    # --- CREATE PASSWD AND GROUP FILES INSIDE JAIL ---
+    grep "^$username:" /etc/passwd > "$jail_path/etc/passwd"
+    grep "^$username:" /etc/group > "$jail_path/etc/group" 2>/dev/null
+    
+    # --- CONFIGURE SSH FOR THIS USER WITH CHROOT ---
+    local sshd_config="/etc/ssh/sshd_config"
+    
+    # Add Match block for this user
+    cat >> "$sshd_config" << EOF
+
+# Minecraft user configurations - $username
+Match User $username
+    ChrootDirectory $jail_path
+    ForceCommand internal-sftp
+    X11Forwarding no
+    AllowTcpForwarding no
+    PermitTTY no
+    PasswordAuthentication yes
+EOF
+    
+    success "$(t "SSH chroot configuration added for" "Konfigurasi SSH chroot ditambahkan untuk") $username"
+    
+    # --- CREATE SYSTEMD SERVICE FILE ---
+    local service_name="$username.service"
+    local service_file="/etc/systemd/system/$service_name"
+    
+    local total_ram=$(free -m | awk '/Mem:/ {print $2}')
+    local ram_per_server=$((total_ram / jumlah_server))
+    [ $ram_per_server -gt 1024 ] && ram_per_server=1024
+    
+    cat > "$service_file" << EOF
+[Unit]
+Description=Minecraft Bedrock Server - $server_name
+After=network.target
+StartLimitInterval=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=$username
+Group=$username
+WorkingDirectory=$server_path
+ExecStart=$server_path/bedrock_server
+Restart=always
+RestartSec=10
+Nice=10
+CPUQuota=70%
+MemoryMax=${ram_per_server}M
+LimitNOFILE=65535
+StandardOutput=append:$server_path/server.log
+StandardError=append:$server_path/error.log
+SuccessExitStatus=0 1
+RestartPreventExitStatus=255
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    success "$(t "Systemd service created" "Systemd service dibuat")"
+    
+    # Final success message
+    success "✅ $(t "Chroot jail setup complete for" "Setup chroot jail selesai untuk") $username"
+    info "$(t "Jail path:" "Path jail:") $jail_path"
+    info "$(t "Server path:" "Path server:") $server_path"
+    info "$(t "SSH/SFTP access will be jailed to:" "Akses SSH/SFTP akan di-jail ke:") /minecraft/$username/"
 }
 
 # Fungsi untuk setup user dengan pilihan password
@@ -337,7 +451,7 @@ setup_user_with_password() {
     # Save user info
     server_users+=("$username|$user_password")
     
-    # Setup user
+    # Setup user with chroot jail
     setup_minecraft_user "$username" "$user_password"
 }
 
@@ -419,6 +533,7 @@ setup_user_and_folders() {
     fi
     
     mkdir -p "$BASE_PATH"
+    mkdir -p "$JAIL_BASE"
     success "$(t "Folder structure ready" "Struktur folder siap")"
 }
 
@@ -440,6 +555,8 @@ get_server_config() {
             1)
                 warning "$(t "Overwriting server..." "Overwrite server...")"
                 rm -rf "$BASE_PATH/$username"
+                rm -rf "$JAIL_BASE/$username"
+                sed -i "\|$username|d" /etc/ssh/sshd_config
                 ;;
             2)
                 return 1
@@ -645,71 +762,11 @@ compression-threshold=1
 compression-algorithm=zlib
 EOF
     
+    # Set ownership
+    chown -R "$username:$username" "$server_path"
+    
     success "$(t "Server for" "Server untuk") $username $(t "ready" "siap")"
     return 0
-}
-
-# Fungsi untuk membuat systemd service - FIXED: simplified, using MemoryMax
-create_systemd() {
-    local config=$1
-    IFS='|' read -r username server_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
-    
-    local service_name="$username.service"
-    local service_file="/etc/systemd/system/$service_name"
-    local server_path="$BASE_PATH/$username"
-    
-    info "$(t "Creating systemd service for" "Membuat systemd service untuk") $username..."
-    
-    # Verify user exists
-    if ! id "$username" &>/dev/null; then
-        error "$(t "User" "User") $username $(t "not found! Creating user..." "tidak ditemukan! Membuat user...")"
-        temp_pass=$(generate_password)
-        setup_minecraft_user "$username" "$temp_pass"
-    fi
-    
-    # Set proper permissions
-    chown -R "$username:$username" "$server_path"
-    chmod -R 755 "$server_path"
-    
-    local total_ram=$(free -m | awk '/Mem:/ {print $2}')
-    local ram_per_server=$((total_ram / jumlah_server))
-    [ $ram_per_server -gt 1024 ] && ram_per_server=1024  # Max 1GB per server for stability
-    
-    # FIXED: Simple service without tmux, using MemoryMax instead of MemoryLimit
-    cat > "$service_file" << EOF
-[Unit]
-Description=Minecraft Bedrock Server - $server_name
-After=network.target
-StartLimitInterval=60
-StartLimitBurst=3
-
-[Service]
-Type=simple
-User=$username
-Group=$username
-WorkingDirectory=$server_path
-ExecStart=$server_path/bedrock_server
-Restart=always
-RestartSec=10
-Nice=10
-CPUQuota=70%
-MemoryMax=${ram_per_server}M
-LimitNOFILE=65535
-StandardOutput=append:$server_path/server.log
-StandardError=append:$server_path/error.log
-SuccessExitStatus=0 1
-RestartPreventExitStatus=255
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    if [ -f "$service_file" ]; then
-        success "$(t "Service" "Service") $service_name $(t "created" "dibuat")"
-        systemd-analyze verify "$service_file" 2>/dev/null || warning "$(t "Service file has warnings" "File service memiliki peringatan")"
-    else
-        error "$(t "Failed to create service file" "Gagal membuat file service")"
-    fi
 }
 
 # Fungsi untuk enable service
@@ -741,9 +798,7 @@ start_all_servers() {
             success "$username $(t "running" "berjalan")"
             
             local pid=$(pgrep -u "$username" -f "bedrock_server" | head -1)
-            if [ -n "$pid" ]; then
-                success "PID: $pid"
-            fi
+            [ -n "$pid" ] && success "PID: $pid"
         else
             error "$username $(t "failed to start" "gagal start")"
             warning "$(t "Check logs:" "Cek log:") journalctl -u $username.service -n 20"
@@ -759,7 +814,7 @@ start_all_servers() {
     done
 }
 
-# Fungsi untuk cleanup total - menghapus SEMUA
+# Fungsi untuk cleanup total
 cleanup_total() {
     clear_screen
     echo -e "\n${RED}══════════════════════════════════════════════════════════${NC}"
@@ -769,7 +824,7 @@ cleanup_total() {
     error "  • $(t "All Minecraft servers" "Semua Minecraft servers")"
     error "  • $(t "All users (mcserver*)" "Semua user (mcserver*)")"
     error "  • $(t "All systemd services" "Semua systemd services")"
-    error "  • $(t "All SSH configurations" "Semua konfigurasi SSH")"
+    error "  • $(t "All chroot jails" "Semua chroot jail")"
     echo
     warning "$(t "Type 'TOTAL-DELETE' to confirm:" "Ketik 'TOTAL-DELETE' untuk konfirmasi:")"
     read -r confirmation
@@ -783,7 +838,6 @@ cleanup_total() {
     info "$(t "Starting total cleanup..." "Memulai total cleanup...")"
     
     # Stop all services
-    info "$(t "Stopping all services..." "Menghentikan semua service...")"
     for service in /etc/systemd/system/mcserver*.service; do
         if [ -f "$service" ]; then
             service_name=$(basename "$service")
@@ -794,39 +848,27 @@ cleanup_total() {
         fi
     done
     
-    # Kill all tmux sessions (if any)
-    info "$(t "Cleaning up tmux sessions..." "Membersihkan tmux sessions...")"
-    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
-        tmux kill-session -t "$user" 2>/dev/null
-    done
-    
-    # Remove all Minecraft users
-    info "$(t "Removing all Minecraft users..." "Menghapus semua Minecraft users...")"
+    # Remove all users
     for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
         pkill -u "$user" 2>/dev/null
         userdel -r "$user" 2>/dev/null
         success "$(t "Removed user:" "Menghapus user:") $user"
     done
     
-    # Remove Minecraft directories
-    info "$(t "Removing Minecraft directories..." "Menghapus direktori Minecraft...")"
+    # Remove directories
     rm -rf "$BASE_PATH"
+    rm -rf "$JAIL_BASE"
     
-    # Clean SSH config from any custom settings
-    info "$(t "Cleaning SSH configuration..." "Membersihkan konfigurasi SSH...")"
-    local sshd_config="/etc/ssh/sshd_config"
-    sed -i '/# Minecraft user configurations/,/^$/d' "$sshd_config"
+    # Clean SSH config
+    sed -i '/# Minecraft user configurations/,/^$/d' /etc/ssh/sshd_config
     
-    # Restore default SSH settings
-    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_config"
-    sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
+    # Clean fstab
+    sed -i "\|$JAIL_BASE|d" /etc/fstab
     
     systemctl daemon-reload
     restart_ssh_service
     
-    success "✅ $(t "Total cleanup complete! Everything has been removed." "Total cleanup selesai! Semua telah dihapus.")"
-    info "$(t "System returned to pre-installation state." "Sistem kembali ke keadaan sebelum instalasi.")"
-    
+    success "✅ $(t "Total cleanup complete!" "Total cleanup selesai!")"
     read -p "$(t "Press Enter to continue..." "Tekan Enter untuk melanjutkan...")"
     show_main_menu
 }
@@ -840,17 +882,15 @@ cleanup_menu() {
     
     echo "  1) $(t "Clean specific server" "Bersihkan server tertentu")"
     echo "  2) $(t "Clean ALL servers and users (TOTAL CLEANUP)" "Bersihkan SEMUA server dan user (TOTAL CLEANUP)")"
-    echo "  3) $(t "Clean orphaned users (no server)" "Bersihkan user yatim (tanpa server)")"
-    echo "  4) $(t "Back to main menu" "Kembali ke menu utama")"
+    echo "  3) $(t "Back to main menu" "Kembali ke menu utama")"
     
-    info "$(t "Choice (1-4):" "Pilihan (1-4):")" "$BLUE"
+    info "$(t "Choice (1-3):" "Pilihan (1-3):")" "$BLUE"
     read -r cleanup_choice
     
     case $cleanup_choice in
         1) cleanup_specific_server ;;
         2) cleanup_total ;;
-        3) cleanup_orphaned_users ;;
-        4) show_main_menu ;;
+        3) show_main_menu ;;
         *) error "$(t "Invalid choice!" "Pilihan tidak valid!")"; sleep 2; cleanup_menu ;;
     esac
 }
@@ -907,47 +947,28 @@ cleanup_specific_server() {
     systemctl disable "$selected_user.service" 2>/dev/null
     rm -f "/etc/systemd/system/$selected_user.service"
     
-    # Kill tmux session (if any)
-    tmux kill-session -t "$selected_user" 2>/dev/null
+    # Remove from fstab
+    sed -i "\|$JAIL_BASE/$selected_user|d" /etc/fstab
     
-    # Kill user processes
-    pkill -u "$selected_user" 2>/dev/null
+    # Unmount
+    umount "$JAIL_BASE/$selected_user/minecraft/$selected_user" 2>/dev/null
     
     # Remove user
+    pkill -u "$selected_user" 2>/dev/null
     userdel -r "$selected_user" 2>/dev/null
     success "$(t "Removed user" "User dihapus") $selected_user"
     
-    # Remove server folder
+    # Remove directories
     rm -rf "$BASE_PATH/$selected_user"
+    rm -rf "$JAIL_BASE/$selected_user"
+    
+    # Remove SSH config
+    sed -i "/Match User $selected_user/,/PasswordAuthentication yes/d" /etc/ssh/sshd_config
     
     systemctl daemon-reload
+    restart_ssh_service
     
     success "$(t "Server" "Server") $selected_user $(t "cleaned up!" "dibersihkan!")"
-    sleep 2
-    cleanup_menu
-}
-
-# Fungsi untuk cleanup orphaned users
-cleanup_orphaned_users() {
-    info "$(t "Looking for orphaned users..." "Mencari user yatim...")"
-    
-    local found=0
-    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
-        if [ ! -d "$BASE_PATH/$user" ]; then
-            warning "$(t "Found orphaned user:" "Ditemukan user yatim:") $user"
-            
-            tmux kill-session -t "$user" 2>/dev/null
-            pkill -u "$user" 2>/dev/null
-            userdel -r "$user" 2>/dev/null
-            success "$(t "Removed orphaned user" "User yatim dihapus") $user"
-            found=1
-        fi
-    done
-    
-    if [ $found -eq 0 ]; then
-        success "$(t "No orphaned users found" "Tidak ada user yatim ditemukan")"
-    fi
-    
     sleep 2
     cleanup_menu
 }
@@ -986,6 +1007,7 @@ list_all_servers() {
                 echo -e "  $(t "Status" "Status")  : $status$pid_info"
                 echo -e "  $(t "Port" "Port")    : ${port:-N/A}"
                 echo -e "  $(t "User" "User")    : $username"
+                echo -e "  $(t "Jail" "Jail")    : $JAIL_BASE/$username"
                 echo -e "  $(t "Path" "Path")    : $dir"
             fi
         fi
@@ -1033,6 +1055,7 @@ install_new_servers() {
     
     check_resources
     check_dependencies
+    configure_ssh
     
     declare -a server_configs=()
     declare -a server_users=()
@@ -1062,22 +1085,10 @@ install_new_servers() {
         error_exit "$(t "No servers were successfully installed" "Tidak ada server yang berhasil diinstall")"
     fi
     
-    # Set ownership setelah server diinstall
-    for user_info in "${server_users[@]}"; do
-        IFS='|' read -r username password <<< "$user_info"
-        chown -R "$username:$username" "$BASE_PATH/$username"
-        chmod -R 755 "$BASE_PATH/$username"
-    done
-    
-    for config in "${server_configs[@]}"; do
-        create_systemd "$config"
-    done
-    
     for config in "${server_configs[@]}"; do
         enable_service "$config"
     done
     
-    # Restart SSH to apply any changes
     restart_ssh_service
     
     # Display credentials
@@ -1094,6 +1105,7 @@ install_new_servers() {
         echo -e "  $(t "Password" "Password")     : ${YELLOW}$password${NC}"
         echo -e "  SSH $(t "Command" "Perintah")  : ssh $username@$ip_address -p $SSH_PORT"
         echo -e "  SFTP URL     : sftp://$username@$ip_address:$SSH_PORT"
+        echo -e "  $(t "Jail Path" "Path Jail")   : $JAIL_BASE/$username/"
         echo -e "  $(t "Server Path" "Path Server")  : $BASE_PATH/$username/"
     done
     
