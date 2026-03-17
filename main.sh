@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Auto Installer v5.3 - Enterprise Edition
-# Dengan True Chroot Jail + SSH Restriction
+# Minecraft Bedrock Server Auto Installer v5.4 - Enterprise Edition
+# Dengan SSH/SFTP Fixed Directory
 
 # Warna untuk output
 RED='\033[0;31m'
@@ -14,11 +14,10 @@ WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Konfigurasi global
-SCRIPT_VERSION="5.3"
+SCRIPT_VERSION="5.4"
 MIN_DISK_SPACE=1024  # MB
 MIN_RAM_PER_SERVER=512  # MB
 SSH_PORT=22
-JAIL_BASE="/home"
 
 # Fungsi untuk clear screen dengan banner
 clear_screen() {
@@ -26,7 +25,7 @@ clear_screen() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - SSH Restricted)           ║"
+    echo "║         (Enterprise Edition - Fixed Directory)          ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -69,18 +68,15 @@ error_exit() {
 check_resources() {
     info "Memeriksa resources sistem..."
     
-    # Cek disk space
     local available_disk=$(df -m /home | awk 'NR==2 {print $4}')
     if [ "$available_disk" -lt "$MIN_DISK_SPACE" ]; then
         error_exit "Disk space tidak cukup! Minimal ${MIN_DISK_SPACE}MB, tersedia ${available_disk}MB"
     fi
     success "Disk space: ${available_disk}MB tersedia"
     
-    # Cek RAM total
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     success "Total RAM: ${total_ram}MB"
     
-    # Cek OS
     if [ ! -f /etc/debian_version ]; then
         warning "Script ini dioptimalkan untuk Debian/Ubuntu"
     fi
@@ -90,7 +86,7 @@ check_resources() {
 check_dependencies() {
     info "Memeriksa dependencies..."
     
-    local deps=("unzip" "curl" "tmux" "systemctl" "chmod" "lsof" "ufw" "wget" "bc" "openssh-server" "openssl" "tmux")
+    local deps=("unzip" "curl" "tmux" "systemctl" "chmod" "lsof" "ufw" "wget" "bc" "openssh-server" "openssl")
     local install_packages=()
     
     for dep in "${deps[@]}"; do
@@ -111,138 +107,156 @@ check_dependencies() {
         fi
     done
     
-    # Install packages jika perlu
     if [ ${#install_packages[@]} -gt 0 ]; then
         info "Menginstall: ${install_packages[*]}"
         apt update && apt install -y ${install_packages[*]} || error_exit "Gagal install dependencies"
         success "Dependencies terinstall"
     fi
     
-    # Configure SSH untuk restricted shell
-    setup_restricted_shell
-}
-
-# Fungsi untuk setup restricted shell (rbash)
-setup_restricted_shell() {
-    info "Setting up restricted shell (rbash)..."
-    
-    # Create rbash symlink if not exists
-    if [ ! -f "/bin/rbash" ]; then
-        ln -s /bin/bash /bin/rbash 2>/dev/null
-        success "rbash created"
+    # Generate SSH host keys if missing
+    if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
+        info "Generating SSH host keys..."
+        dpkg-reconfigure openssh-server
+        systemctl restart sshd
     fi
     
-    # Configure SSH to allow rbash
-    local sshd_config="/etc/ssh/sshd_config"
+    configure_ssh
+}
+
+# Fungsi untuk configure SSH
+configure_ssh() {
+    info "Configuring SSH for proper SFTP/SSH access..."
     
-    # Ensure AllowTcpForwarding is disabled for all
-    if grep -q "^AllowTcpForwarding" "$sshd_config"; then
-        sed -i 's/^AllowTcpForwarding.*/AllowTcpForwarding no/' "$sshd_config"
-    else
-        echo "AllowTcpForwarding no" >> "$sshd_config"
+    local sshd_config="/etc/ssh/sshd_config"
+    local backup="/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
+    
+    # Backup
+    cp "$sshd_config" "$backup"
+    
+    # Ensure password authentication is enabled
+    sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_config"
+    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_config"
+    
+    # Disable root login
+    sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
+    
+    # Enable SFTP internal
+    if ! grep -q "Subsystem sftp internal-sftp" "$sshd_config"; then
+        echo "Subsystem sftp internal-sftp" >> "$sshd_config"
     fi
     
     systemctl restart sshd
-    success "SSH configured for restricted shell"
+    success "SSH configured"
 }
 
-# Fungsi untuk membuat restricted user (rbash)
-create_restricted_user() {
+# Fungsi untuk generate random password
+generate_password() {
+    openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*' | fold -w 16 | head -n 1
+}
+
+# Fungsi untuk setup user dengan akses SSH/SFTP yang benar
+setup_minecraft_user() {
     local username=$1
     local password=$2
     local server_folder=$3
+    local server_path="/home/minecraft/$server_folder"
     
-    info "Creating restricted user: $username"
+    info "Setting up user: $username"
     
-    # Create user with rbash as shell
+    # Create user if not exists
     if ! id "$username" &>/dev/null; then
-        useradd -m -d "/home/$username" -s /bin/rbash "$username"
-        
-        # Set password
-        echo "$username:$password" | chpasswd
-        success "User $username created with rbash shell"
-        
-        # Create restricted PATH
-        mkdir -p "/home/$username/bin"
-        
-        # Create .bashrc yang sangat terbatas
-        cat > "/home/$username/.bashrc" << 'EOF'
-# Restricted bashrc
-PATH=/home/$USER/bin
-export PATH
-PS1='[\u@\h \W]$ '
-echo "Welcome to restricted shell. Available commands: help, ls, cd, exit"
-alias ls='ls --color=auto'
-alias ll='ls -la'
-alias la='ls -a'
-EOF
-        
-        # Create allowed commands symlinks
-        local allowed_commands=("ls" "cd" "pwd" "exit" "clear" "help")
-        for cmd in "${allowed_commands[@]}"; do
-            ln -s "/bin/$cmd" "/home/$username/bin/$cmd" 2>/dev/null
-        done
-        
-        # Lock down permissions
-        chown -R "$username:$username" "/home/$username"
-        chmod 755 "/home/$username"
-        chmod 750 "/home/$username/bin"
-        
-        # SSH jail - chroot directory
-        mkdir -p "/home/$username/minecraft"
-        
-        # Bind mount server folder
-        if ! grep -q "/home/$username/minecraft/$server_folder" /etc/fstab; then
-            echo "/home/minecraft/$server_folder /home/$username/minecraft/$server_folder none bind 0 0" >> /etc/fstab
-        fi
-        
-        mount --bind "/home/minecraft/$server_folder" "/home/$username/minecraft/$server_folder" 2>/dev/null
-        
-        # Create symbolic link di home user
-        ln -s "/home/$username/minecraft/$server_folder" "/home/$username/server" 2>/dev/null
-        
-        success "Restricted environment created for $username"
+        useradd -m -d "/home/$username" -s /bin/bash "$username"
+        success "User $username created"
     else
         warning "User $username already exists"
+        # Kill any processes by this user
+        pkill -u "$username" 2>/dev/null
     fi
-}
+    
+    # Set password
+    echo "$username:$password" | chpasswd
+    success "Password set for $username"
+    
+    # Remove any existing bind mounts
+    umount "/home/$username/minecraft" 2>/dev/null
+    sed -i "\|/home/$username/minecraft|d" /etc/fstab
+    
+    # Create minecraft directory in user home
+    mkdir -p "/home/$username/minecraft"
+    
+    # Bind mount the server folder to user's minecraft directory
+    if ! grep -q "/home/$username/minecraft" /etc/fstab; then
+        echo "$server_path /home/$username/minecraft none bind 0 0" >> /etc/fstab
+    fi
+    
+    # Mount it
+    mount --bind "$server_path" "/home/$username/minecraft" 2>/dev/null
+    
+    # Create symlink directly in home
+    ln -sf "/home/$username/minecraft" "/home/$username/server"
+    
+    # Set proper ownership
+    chown -R "$username:$username" "/home/$username"
+    chmod 755 "/home/$username"
+    
+    # Create .bashrc that automatically cd to minecraft directory
+    cat > "/home/$username/.bashrc" << EOF
+# Auto cd to minecraft directory on login
+if [ -d "\$HOME/minecraft" ]; then
+    cd "\$HOME/minecraft"
+fi
 
-# Fungsi untuk setup Minecraft user (untuk run server)
-setup_minecraft_user() {
-    local username=$1
-    local server_folder=$2
+# Simple prompt
+PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\W\[\e[0m\]\$ '
+
+# Aliases
+alias ll='ls -la'
+alias la='ls -a'
+alias l='ls -CF'
+
+# No dangerous commands
+alias sudo='echo "sudo not allowed"'
+alias apt='echo "apt not allowed"'
+alias systemctl='echo "systemctl not allowed"'
+alias service='echo "service not allowed"'
+alias dpkg='echo "dpkg not allowed"'
+
+echo "Welcome to Minecraft Server - $server_folder"
+echo "You are in your server directory. Files available:"
+ls -F --color=auto
+EOF
     
-    info "Setting up Minecraft server user: $username"
+    # Set proper permissions for .bashrc
+    chown "$username:$username" "/home/$username/.bashrc"
     
-    if ! id "$username" &>/dev/null; then
-        useradd -m -s /bin/bash -d "/home/$username" "$username"
-        success "Minecraft user $username created"
-    else
-        warning "Minecraft user $username already exists"
-    fi
+    # Ensure SSH directory exists for future key-based auth
+    mkdir -p "/home/$username/.ssh"
+    chmod 700 "/home/$username/.ssh"
+    chown "$username:$username" "/home/$username/.ssh"
     
-    # Ensure server folder exists and set ownership
-    mkdir -p "/home/minecraft/$server_folder"
-    chown -R "$username:$username" "/home/minecraft/$server_folder"
-    success "Server folder ownership set to $username"
+    # Add user to appropriate groups
+    usermod -aG "$username" "$username"
+    
+    success "User $username setup complete"
+    success "  SSH:  ssh $username@$(hostname -I | awk '{print $1}')"
+    success "  SFTP: sftp $username@$(hostname -I | awk '{print $1}')"
+    success "  Home: /home/$username/minecraft/ -> $server_path"
 }
 
 # Fungsi untuk setup user dengan pilihan password
 setup_user_with_password() {
     local server_index=$1
     local server_folder=$2
-    local minecraft_user="mcserver$server_index"
-    local restricted_user="$minecraft_user"  # Same username for both (restricted shell)
+    local username="mcserver$server_index"
     
     echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     info "Konfigurasi User untuk Server #$server_index" "$PURPLE"
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
-    # Create Minecraft user first (for running server)
-    setup_minecraft_user "$minecraft_user" "$server_folder"
+    info "Username: $username"
     
-    # Password untuk restricted user (same as Minecraft user password)
-    info "Pilih metode password untuk $minecraft_user:" "$BLUE"
+    info "Pilih metode password:" "$BLUE"
     echo "  1) Generate random password (recommended)"
     echo "  2) Masukkan password manual"
     info "Pilihan (default: 1):" "$BLUE"
@@ -275,15 +289,10 @@ setup_user_with_password() {
     esac
     
     # Save user info
-    server_users+=("$minecraft_user|$user_password|$server_folder")
+    server_users+=("$username|$user_password|$server_folder")
     
-    # Create restricted user (rbash) - same username
-    create_restricted_user "$minecraft_user" "$user_password" "$server_folder"
-}
-
-# Fungsi untuk generate random password
-generate_password() {
-    openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*' | fold -w 16 | head -n 1
+    # Setup user
+    setup_minecraft_user "$username" "$user_password" "$server_folder"
 }
 
 # Fungsi untuk validasi port
@@ -355,7 +364,7 @@ setup_user_and_folders() {
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     local min_ram_needed=$((jumlah_server * MIN_RAM_PER_SERVER))
     if [ "$total_ram" -lt "$min_ram_needed" ]; then
-        warning "RAM mungkin tidak cukup: ${total_ram}MB total, minimal ${min_ram_needed}MB untuk $jumlah_server server"
+        warning "RAM mungkin tidak cukup: ${total_ram}MB total, minimal ${min_ram_needed}MB"
         info "Lanjutkan? [y/N]" "$BLUE"
         read -r continue_anyway
         if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
@@ -519,8 +528,6 @@ select_version() {
 setup_server() {
     local config=$1
     IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
-    local minecraft_user="mcserver$(echo $folder_name | grep -o '[0-9]*' | head -1)"
-    [ -z "$minecraft_user" ] && minecraft_user="mcserver1"
     
     info "Setup server: $server_name"
     
@@ -598,36 +605,32 @@ compression-threshold=1
 compression-algorithm=zlib
 EOF
     
-    # Set ownership to Minecraft user
-    chown -R "$minecraft_user:$minecraft_user" "/home/minecraft/$folder_name"
-    
     success "Server $server_name siap"
     return 0
 }
 
-# Fungsi untuk membuat systemd service (FIXED VERSION)
+# Fungsi untuk membuat systemd service
 create_systemd() {
     local config=$1
     IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
     
     local service_name="$folder_name.service"
     local service_file="/etc/systemd/system/$service_name"
-    local minecraft_user="mcserver$(echo $folder_name | grep -o '[0-9]*' | head -1)"
-    [ -z "$minecraft_user" ] && minecraft_user="mcserver1"
+    local username="mcserver$(echo $folder_name | grep -o '[0-9]*' | head -1)"
+    [ -z "$username" ] && username="mcserver1"
     
     info "Membuat systemd service untuk $server_name..."
     
-    # Verify user exists
-    if ! id "$minecraft_user" &>/dev/null; then
-        error "User $minecraft_user tidak ditemukan! Membuat user..."
-        useradd -m -s /bin/bash -d "/home/$minecraft_user" "$minecraft_user"
+    if ! id "$username" &>/dev/null; then
+        error "User $username tidak ditemukan! Membuat user..."
+        temp_pass=$(generate_password)
+        setup_minecraft_user "$username" "$temp_pass" "$folder_name"
     fi
     
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     local ram_per_server=$((total_ram / jumlah_server))
     [ $ram_per_server -gt 2048 ] && ram_per_server=2048
     
-    # FIXED: Menggunakan bash -c untuk menjalankan server
     cat > "$service_file" << EOF
 [Unit]
 Description=Minecraft Bedrock Server - $server_name
@@ -637,8 +640,8 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-User=$minecraft_user
-Group=$minecraft_user
+User=$username
+Group=$username
 WorkingDirectory=/home/minecraft/$folder_name
 ExecStart=/bin/bash -c 'cd /home/minecraft/$folder_name && exec ./bedrock_server'
 ExecStop=/bin/kill -TERM \$MAINPID
@@ -659,12 +662,9 @@ RestartPreventExitStatus=255
 WantedBy=multi-user.target
 EOF
     
-    # Verify service file
     if [ -f "$service_file" ]; then
         success "Service $service_name dibuat"
-        
-        # Test service file syntax
-        systemd-analyze verify "$service_file" 2>/dev/null || warning "Service file has warnings but will work"
+        systemd-analyze verify "$service_file" 2>/dev/null || warning "Service file has warnings"
     else
         error "Gagal membuat service file"
     fi
@@ -697,8 +697,6 @@ start_all_servers() {
         sleep 3
         if systemctl is-active --quiet "$folder_name.service"; then
             success "$server_name running"
-            
-            # Show process info
             pgrep -f "bedrock_server.*$folder_name" > /dev/null && \
                 success "Process ID: $(pgrep -f "bedrock_server.*$folder_name")"
         else
@@ -716,15 +714,95 @@ start_all_servers() {
     done
 }
 
-# Fungsi untuk cleanup semua file Minecraft
-cleanup_all() {
+# Fungsi untuk cleanup total - menghapus SEMUA
+cleanup_total() {
     clear_screen
     echo -e "\n${RED}══════════════════════════════════════════════════════════${NC}"
-    info "CLEANUP MENU - DESTRUCTIVE ACTION" "$RED"
+    error "⚠️  TOTAL CLEANUP - MENGHAPUS SEMUA!  ⚠️"
+    echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
+    error "Ini akan menghapus:"
+    error "  • Semua Minecraft servers"
+    error "  • Semua user (mcserver*)"
+    error "  • Semua systemd services"
+    error "  • Semua bind mounts"
+    error "  • Semua konfigurasi SSH terkait"
+    error "  • Semua file di /home/minecraft/"
+    error "  • Semua file di /home/mcserver*/"
+    echo
+    warning "Ketik 'TOTAL-DELETE' untuk konfirmasi:"
+    read -r confirmation
+    
+    if [ "$confirmation" != "TOTAL-DELETE" ]; then
+        warning "Total cleanup dibatalkan"
+        cleanup_menu
+        return
+    fi
+    
+    info "Memulai total cleanup..."
+    
+    # Stop all services
+    info "Stopping all services..."
+    for service in /etc/systemd/system/mcserver*.service /etc/systemd/system/*.service; do
+        if [ -f "$service" ] && grep -q "Minecraft Bedrock" "$service" 2>/dev/null; then
+            service_name=$(basename "$service")
+            systemctl stop "$service_name" 2>/dev/null
+            systemctl disable "$service_name" 2>/dev/null
+            rm -f "$service"
+            success "Removed service: $service_name"
+        fi
+    done
+    
+    # Remove all bind mounts from fstab
+    info "Cleaning fstab..."
+    sed -i "\|/home/minecraft|d" /etc/fstab
+    sed -i "\|/home/mcserver|d" /etc/fstab
+    
+    # Unmount all bind mounts
+    info "Unmounting all bind mounts..."
+    mount | grep "/home/mcserver" | awk '{print $3}' | xargs -r umount -f 2>/dev/null
+    mount | grep "/home/minecraft" | grep -v "/home/minecraft$" | awk '{print $3}' | xargs -r umount -f 2>/dev/null
+    
+    # Remove all Minecraft users
+    info "Removing all Minecraft users..."
+    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
+        pkill -u "$user" 2>/dev/null
+        userdel -r "$user" 2>/dev/null
+        success "Removed user: $user"
+    done
+    
+    # Remove Minecraft directories
+    info "Removing Minecraft directories..."
+    rm -rf /home/minecraft
+    rm -rf /home/mcserver* 2>/dev/null
+    
+    # Clean SSH config from any custom settings
+    info "Cleaning SSH configuration..."
+    local sshd_config="/etc/ssh/sshd_config"
+    sed -i '/# Minecraft user configurations/,/^$/d' "$sshd_config"
+    
+    # Restore default SSH settings
+    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_config"
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
+    
+    systemctl daemon-reload
+    systemctl restart sshd
+    
+    success "✅ Total cleanup selesai! Semua telah dihapus."
+    info "Sistem kembali ke keadaan awal sebelum instalasi Minecraft."
+    
+    read -p "Press Enter to continue..."
+    show_main_menu
+}
+
+# Fungsi untuk cleanup menu
+cleanup_menu() {
+    clear_screen
+    echo -e "\n${RED}══════════════════════════════════════════════════════════${NC}"
+    info "CLEANUP MENU" "$RED"
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
     
     echo "  1) Clean specific server"
-    echo "  2) Clean ALL servers and users"
+    echo "  2) Clean ALL servers and users (TOTAL CLEANUP)"
     echo "  3) Clean orphaned users (no server)"
     echo "  4) Back to main menu"
     
@@ -733,10 +811,10 @@ cleanup_all() {
     
     case $cleanup_choice in
         1) cleanup_specific_server ;;
-        2) cleanup_all_servers ;;
+        2) cleanup_total ;;
         3) cleanup_orphaned_users ;;
         4) show_main_menu ;;
-        *) error "Pilihan tidak valid!"; sleep 2; cleanup_all ;;
+        *) error "Pilihan tidak valid!"; sleep 2; cleanup_menu ;;
     esac
 }
 
@@ -758,7 +836,7 @@ cleanup_specific_server() {
     if [ ${#servers[@]} -eq 0 ]; then
         error "No servers found"
         sleep 2
-        cleanup_all
+        cleanup_menu
         return
     fi
     
@@ -768,21 +846,20 @@ cleanup_specific_server() {
     
     if ! [[ "$server_choice" =~ ^[0-9]+$ ]] || [ "$server_choice" -lt 1 ] || [ "$server_choice" -gt ${#servers[@]} ]; then
         error "Pilihan tidak valid"
-        cleanup_all
+        cleanup_menu
         return
     fi
     
     local selected_server="${servers[$((server_choice-1))]}"
     
     echo
-    error "⚠⚠⚠ PERINGATAN! ⚠⚠⚠"
-    error "Anda akan menghapus server: $selected_server"
+    error "⚠️ PERINGATAN! Menghapus server: $selected_server"
     info "Ketik 'DELETE' untuk konfirmasi:" "$BLUE"
     read -r confirmation
     
     if [ "$confirmation" != "DELETE" ]; then
         warning "Cleanup dibatalkan"
-        cleanup_all
+        cleanup_menu
         return
     fi
     
@@ -794,18 +871,22 @@ cleanup_specific_server() {
     # Remove from fstab
     sed -i "\|/home/minecraft/$selected_server|d" /etc/fstab
     
-    # Find and remove related users
-    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
-        if [ -d "/home/minecraft/$selected_server" ] && [ "$(stat -c '%U' "/home/minecraft/$selected_server" 2>/dev/null)" == "$user" ]; then
-            # Unmount bind mounts
-            umount "/home/$user/minecraft/$selected_server" 2>/dev/null
-            sed -i "\|/home/$user/minecraft/$selected_server|d" /etc/fstab
-            
-            # Remove user
-            userdel -r "$user" 2>/dev/null
-            success "Removed user $user"
-        fi
-    done
+    # Find and remove related user
+    local username="mcserver$(echo $selected_server | grep -o '[0-9]*' | head -1)"
+    if id "$username" &>/dev/null; then
+        info "Removing user $username..."
+        
+        # Unmount bind mounts
+        umount "/home/$username/minecraft" 2>/dev/null
+        sed -i "\|/home/$username/minecraft|d" /etc/fstab
+        
+        # Kill user processes
+        pkill -u "$username" 2>/dev/null
+        
+        # Remove user
+        userdel -r "$username" 2>/dev/null
+        success "Removed user $username"
+    fi
     
     # Remove server folder
     rm -rf "/home/minecraft/$selected_server"
@@ -814,53 +895,7 @@ cleanup_specific_server() {
     
     success "Server $selected_server cleaned up!"
     sleep 2
-    cleanup_all
-}
-
-# Fungsi untuk cleanup semua server
-cleanup_all_servers() {
-    clear_screen
-    echo -e "\n${RED}⚠⚠⚠ FINAL WARNING! ⚠⚠⚠${NC}"
-    error "Ini akan menghapus SEMUA server, users, dan konfigurasi!"
-    info "Ketik 'DELETE ALL' untuk konfirmasi:" "$BLUE"
-    read -r confirmation
-    
-    if [ "$confirmation" != "DELETE ALL" ]; then
-        warning "Cleanup dibatalkan"
-        cleanup_all
-        return
-    fi
-    
-    # Stop all services
-    for service in /etc/systemd/system/*.service; do
-        if grep -q "Minecraft Bedrock" "$service" 2>/dev/null; then
-            service_name=$(basename "$service")
-            systemctl stop "$service_name"
-            systemctl disable "$service_name"
-            rm -f "$service"
-        fi
-    done
-    
-    # Remove all users (mcserver*)
-    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
-        # Unmount all bind mounts
-        umount "/home/$user/minecraft/"* 2>/dev/null
-        userdel -r "$user" 2>/dev/null
-        success "Removed user $user"
-    done
-    
-    # Remove all server folders
-    rm -rf /home/minecraft/*
-    
-    # Clean fstab
-    sed -i "\|/home/minecraft|d" /etc/fstab
-    sed -i "\|/home/mcserver|d" /etc/fstab
-    
-    systemctl daemon-reload
-    
-    success "All servers and users have been removed!"
-    sleep 2
-    show_main_menu
+    cleanup_menu
 }
 
 # Fungsi untuk cleanup orphaned users
@@ -871,9 +906,8 @@ cleanup_orphaned_users() {
     for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
         local has_server=0
         
-        # Check if user owns any server folder
         for server in /home/minecraft/*; do
-            if [ -d "$server" ] && [ "$(stat -c '%U' "$server" 2>/dev/null)" == "$user" ]; then
+            if [ -d "$server" ] && [ "$(basename "$server")" == "server${user#mcserver}" ]; then
                 has_server=1
                 break
             fi
@@ -882,11 +916,9 @@ cleanup_orphaned_users() {
         if [ $has_server -eq 0 ]; then
             warning "Found orphaned user: $user"
             
-            # Unmount any mounts
-            umount "/home/$user/minecraft/"* 2>/dev/null
+            umount "/home/$user/minecraft" 2>/dev/null
             sed -i "\|/home/$user|d" /etc/fstab
-            
-            # Remove user
+            pkill -u "$user" 2>/dev/null
             userdel -r "$user" 2>/dev/null
             success "Removed orphaned user $user"
             found=1
@@ -898,12 +930,7 @@ cleanup_orphaned_users() {
     fi
     
     sleep 2
-    cleanup_all
-}
-
-# Fungsi untuk uninstall server (menu option 2)
-uninstall_server() {
-    cleanup_specific_server
+    cleanup_menu
 }
 
 # Fungsi untuk list semua server
@@ -922,8 +949,6 @@ list_all_servers() {
             if [ -f "$dir/bedrock_server" ]; then
                 if systemctl is-active --quiet "$server_name.service" 2>/dev/null; then
                     status="${GREEN}● RUNNING${NC}"
-                    
-                    # Get PID
                     pid=$(pgrep -f "bedrock_server.*$server_name" | head -1)
                     [ -n "$pid" ] && pid_info=" (PID: $pid)" || pid_info=""
                 else
@@ -936,12 +961,19 @@ list_all_servers() {
             fi
             
             port=$(grep "^server-port=" "$dir/server.properties" 2>/dev/null | cut -d'=' -f2)
-            owner=$(stat -c '%U' "$dir" 2>/dev/null)
+            
+            # Get associated user
+            username="mcserver$(echo $server_name | grep -o '[0-9]*' | head -1)"
+            if id "$username" &>/dev/null; then
+                user_info="$username"
+            else
+                user_info="none"
+            fi
             
             echo -e "\n${PURPLE}📁 $server_name${NC}"
             echo -e "  Status  : $status$pid_info"
             echo -e "  Port    : ${port:-N/A}"
-            echo -e "  Owner   : $owner"
+            echo -e "  User    : $user_info"
             echo -e "  Path    : $dir"
         fi
     done
@@ -973,9 +1005,9 @@ show_main_menu() {
     
     case $menu_choice in
         1) install_new_servers ;;
-        2) uninstall_server ;;
+        2) cleanup_specific_server ;;
         3) list_all_servers ;;
-        4) cleanup_all ;;
+        4) cleanup_menu ;;
         5) exit 0 ;;
         *) error "Pilihan tidak valid!"; sleep 2; show_main_menu ;;
     esac
@@ -989,7 +1021,6 @@ install_new_servers() {
     check_resources
     check_dependencies
     
-    # Initialize arrays
     declare -a server_configs=()
     declare -a server_users=()
     
@@ -1018,6 +1049,12 @@ install_new_servers() {
         error_exit "Tidak ada server yang berhasil diinstall"
     fi
     
+    # Set ownership setelah server diinstall
+    for user_info in "${server_users[@]}"; do
+        IFS='|' read -r username password server_folder <<< "$user_info"
+        chown -R "$username:$username" "/home/minecraft/$server_folder"
+    done
+    
     for config in "${server_configs[@]}"; do
         create_systemd "$config"
     done
@@ -1040,11 +1077,8 @@ install_new_servers() {
         echo -e "  Password     : ${YELLOW}$password${NC}"
         echo -e "  SSH Command  : ssh $username@$ip_address -p $SSH_PORT"
         echo -e "  SFTP URL     : sftp://$username@$ip_address:$SSH_PORT"
-        echo -e "  Restrictions : - Restricted shell (rbash)"
-        echo -e "                 - Cannot use sudo"
-        echo -e "                 - Cannot run system commands"
-        echo -e "                 - Only cd, ls, exit in home"
-        echo -e "  Server Path  : ~/server/ -> /home/minecraft/$server_folder/"
+        echo -e "  Server Path  : /home/$username/minecraft/ (auto-cd on login)"
+        echo -e "  Direct Path  : /home/minecraft/$server_folder/"
     done
     
     echo -e "\n${RED}⚠ IMPORTANT: Save these passwords! They won't be shown again.${NC}"
