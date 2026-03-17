@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Auto Installer v5.4 - Enterprise Edition
-# Dengan SSH/SFTP Fixed Directory
+# Minecraft Bedrock Server Auto Installer v5.5 - Enterprise Edition
+# Dengan Tmux-based Service + Language Selection
 
 # Warna untuk output
 RED='\033[0;31m'
@@ -14,10 +14,15 @@ WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Konfigurasi global
-SCRIPT_VERSION="5.4"
+SCRIPT_VERSION="5.5"
 MIN_DISK_SPACE=1024  # MB
 MIN_RAM_PER_SERVER=512  # MB
 SSH_PORT=22
+
+# Language variables
+LANG_EN=0
+LANG_ID=1
+CURRENT_LANG=$LANG_EN
 
 # Fungsi untuk clear screen dengan banner
 clear_screen() {
@@ -25,9 +30,21 @@ clear_screen() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - Fixed Directory)          ║"
+    echo "║         (Enterprise Edition - Tmux Service)             ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
+}
+
+# Fungsi untuk mendapatkan teks berdasarkan bahasa
+t() {
+    local en_text=$1
+    local id_text=$2
+    
+    if [ "$CURRENT_LANG" -eq "$LANG_ID" ]; then
+        echo "$id_text"
+    else
+        echo "$en_text"
+    fi
 }
 
 # Fungsi untuk logging dengan timestamp
@@ -64,27 +81,50 @@ error_exit() {
     exit 1
 }
 
+# Fungsi untuk memilih bahasa
+select_language() {
+    clear_screen
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    echo "  Select Language / Pilih Bahasa"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    echo "  0) English (Default)"
+    echo "  1) Indonesian"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
+    info "Choice / Pilihan (0-1):" "$BLUE"
+    read -r lang_choice
+    
+    case $lang_choice in
+        1) CURRENT_LANG=$LANG_ID
+           success "Bahasa Indonesia dipilih"
+           ;;
+        *) CURRENT_LANG=$LANG_EN
+           success "English selected"
+           ;;
+    esac
+    sleep 1
+}
+
 # Fungsi untuk mengecek system resources
 check_resources() {
-    info "Memeriksa resources sistem..."
+    info "$(t "Checking system resources..." "Memeriksa resources sistem...")"
     
     local available_disk=$(df -m /home | awk 'NR==2 {print $4}')
     if [ "$available_disk" -lt "$MIN_DISK_SPACE" ]; then
-        error_exit "Disk space tidak cukup! Minimal ${MIN_DISK_SPACE}MB, tersedia ${available_disk}MB"
+        error_exit "$(t "Insufficient disk space! Minimum ${MIN_DISK_SPACE}MB, available ${available_disk}MB" "Disk space tidak cukup! Minimal ${MIN_DISK_SPACE}MB, tersedia ${available_disk}MB")"
     fi
-    success "Disk space: ${available_disk}MB tersedia"
+    success "$(t "Disk space: ${available_disk}MB available" "Disk space: ${available_disk}MB tersedia")"
     
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
-    success "Total RAM: ${total_ram}MB"
+    success "$(t "Total RAM: ${total_ram}MB" "Total RAM: ${total_ram}MB")"
     
     if [ ! -f /etc/debian_version ]; then
-        warning "Script ini dioptimalkan untuk Debian/Ubuntu"
+        warning "$(t "This script is optimized for Debian/Ubuntu" "Script ini dioptimalkan untuk Debian/Ubuntu")"
     fi
 }
 
 # Fungsi untuk mengecek dan install dependencies
 check_dependencies() {
-    info "Memeriksa dependencies..."
+    info "$(t "Checking dependencies..." "Memeriksa dependencies...")"
     
     local deps=("unzip" "curl" "tmux" "systemctl" "chmod" "lsof" "ufw" "wget" "bc" "openssh-server" "openssl")
     local install_packages=()
@@ -95,27 +135,27 @@ check_dependencies() {
                 if ! systemctl list-unit-files | grep -q ssh; then
                     install_packages+=($dep)
                 else
-                    success "sshd tersedia"
+                    success "sshd $(t "available" "tersedia")"
                     continue
                 fi
             else
-                warning "$dep tidak ditemukan"
+                warning "$dep $(t "not found" "tidak ditemukan")"
                 install_packages+=($dep)
             fi
         else
-            success "$dep tersedia"
+            success "$dep $(t "available" "tersedia")"
         fi
     done
     
     if [ ${#install_packages[@]} -gt 0 ]; then
-        info "Menginstall: ${install_packages[*]}"
-        apt update && apt install -y ${install_packages[*]} || error_exit "Gagal install dependencies"
-        success "Dependencies terinstall"
+        info "$(t "Installing: ${install_packages[*]}" "Menginstall: ${install_packages[*]}")"
+        apt update && apt install -y ${install_packages[*]} || error_exit "$(t "Failed to install dependencies" "Gagal install dependencies")"
+        success "$(t "Dependencies installed" "Dependencies terinstall")"
     fi
     
     # Generate SSH host keys if missing
     if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-        info "Generating SSH host keys..."
+        info "$(t "Generating SSH host keys..." "Membuat SSH host keys...")"
         dpkg-reconfigure openssh-server
         systemctl restart sshd
     fi
@@ -125,7 +165,7 @@ check_dependencies() {
 
 # Fungsi untuk configure SSH
 configure_ssh() {
-    info "Configuring SSH for proper SFTP/SSH access..."
+    info "$(t "Configuring SSH for proper SFTP/SSH access..." "Mengkonfigurasi SSH untuk akses SFTP/SSH...")"
     
     local sshd_config="/etc/ssh/sshd_config"
     local backup="/etc/ssh/sshd_config.backup.$(date +%Y%m%d)"
@@ -147,7 +187,7 @@ configure_ssh() {
     fi
     
     systemctl restart sshd
-    success "SSH configured"
+    success "$(t "SSH configured" "SSH dikonfigurasi")"
 }
 
 # Fungsi untuk generate random password
@@ -162,21 +202,21 @@ setup_minecraft_user() {
     local server_folder=$3
     local server_path="/home/minecraft/$server_folder"
     
-    info "Setting up user: $username"
+    info "$(t "Setting up user:" "Membuat user:") $username"
     
     # Create user if not exists
     if ! id "$username" &>/dev/null; then
         useradd -m -d "/home/$username" -s /bin/bash "$username"
-        success "User $username created"
+        success "$(t "User" "User") $username $(t "created" "dibuat")"
     else
-        warning "User $username already exists"
+        warning "$(t "User" "User") $username $(t "already exists" "sudah ada")"
         # Kill any processes by this user
         pkill -u "$username" 2>/dev/null
     fi
     
     # Set password
     echo "$username:$password" | chpasswd
-    success "Password set for $username"
+    success "$(t "Password set for" "Password diatur untuk") $username"
     
     # Remove any existing bind mounts
     umount "/home/$username/minecraft" 2>/dev/null
@@ -222,8 +262,8 @@ alias systemctl='echo "systemctl not allowed"'
 alias service='echo "service not allowed"'
 alias dpkg='echo "dpkg not allowed"'
 
-echo "Welcome to Minecraft Server - $server_folder"
-echo "You are in your server directory. Files available:"
+echo "$(t "Welcome to Minecraft Server -" "Selamat datang di Minecraft Server -") $server_folder"
+echo "$(t "You are in your server directory. Files available:" "Anda berada di direktori server. File tersedia:")"
 ls -F --color=auto
 EOF
     
@@ -238,10 +278,7 @@ EOF
     # Add user to appropriate groups
     usermod -aG "$username" "$username"
     
-    success "User $username setup complete"
-    success "  SSH:  ssh $username@$(hostname -I | awk '{print $1}')"
-    success "  SFTP: sftp $username@$(hostname -I | awk '{print $1}')"
-    success "  Home: /home/$username/minecraft/ -> $server_path"
+    success "$(t "User" "User") $username $(t "setup complete" "setup selesai")"
 }
 
 # Fungsi untuk setup user dengan pilihan password
@@ -251,32 +288,32 @@ setup_user_with_password() {
     local username="mcserver$server_index"
     
     echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    info "Konfigurasi User untuk Server #$server_index" "$PURPLE"
+    info "$(t "User Configuration for Server #$server_index" "Konfigurasi User untuk Server #$server_index")" "$PURPLE"
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
-    info "Username: $username"
+    info "$(t "Username:" "Username:") $username"
     
-    info "Pilih metode password:" "$BLUE"
-    echo "  1) Generate random password (recommended)"
-    echo "  2) Masukkan password manual"
-    info "Pilihan (default: 1):" "$BLUE"
+    info "$(t "Choose password method:" "Pilih metode password:")" "$BLUE"
+    echo "  1) $(t "Generate random password (recommended)" "Generate random password (disarankan)")"
+    echo "  2) $(t "Enter password manually" "Masukkan password manual")"
+    info "$(t "Choice (default: 1):" "Pilihan (default: 1):")" "$BLUE"
     read -r password_choice
     
     local user_password
     case $password_choice in
         2)
             while true; do
-                info "Masukkan password (min 8 karakter):" "$BLUE"
+                info "$(t "Enter password (min 8 characters):" "Masukkan password (min 8 karakter):")" "$BLUE"
                 read -s user_password
                 echo
-                info "Konfirmasi password:" "$BLUE"
+                info "$(t "Confirm password:" "Konfirmasi password:")" "$BLUE"
                 read -s user_password_confirm
                 echo
                 
                 if [ "$user_password" != "$user_password_confirm" ]; then
-                    error "Password tidak cocok!"
+                    error "$(t "Passwords do not match!" "Password tidak cocok!")"
                 elif [ ${#user_password} -lt 8 ]; then
-                    error "Password minimal 8 karakter!"
+                    error "$(t "Password minimum 8 characters!" "Password minimal 8 karakter!")"
                 else
                     break
                 fi
@@ -284,7 +321,7 @@ setup_user_with_password() {
             ;;
         *)
             user_password=$(generate_password)
-            success "Random password generated"
+            success "$(t "Random password generated" "Random password dibuat")"
             ;;
     esac
     
@@ -311,12 +348,12 @@ check_port() {
     local server_index=$3
     
     if ! validate_port "$port_value"; then
-        error "Port $port_value tidak valid (1024-65535)"
+        error "$(t "Port" "Port") $port_value $(t "invalid (1024-65535)" "tidak valid (1024-65535)")"
         return 1
     fi
     
     if lsof -i:"$port_value" >/dev/null 2>&1; then
-        warning "Port $port_value sudah dipakai"
+        warning "$(t "Port" "Port") $port_value $(t "already in use" "sudah dipakai")"
         
         local new_port=$port_value
         local max_attempts=100
@@ -329,14 +366,14 @@ check_port() {
         done
         
         if [ $attempt -eq $max_attempts ]; then
-            error "Tidak ada port kosong"
+            error "$(t "No available port found" "Tidak ada port kosong")"
             return 1
         fi
         
-        success "Menggunakan port $new_port"
+        success "$(t "Using port" "Menggunakan port") $new_port"
         eval "$port_var=$new_port"
     else
-        success "Port $port_value tersedia"
+        success "$(t "Port" "Port") $port_value $(t "available" "tersedia")"
     fi
     return 0
 }
@@ -349,23 +386,23 @@ sanitize_folder_name() {
 
 # Fungsi untuk setup user dan folders
 setup_user_and_folders() {
-    info "Setup user dan folder..."
+    info "$(t "Setting up users and folders..." "Membuat user dan folder...")"
     
     while true; do
-        info "Masukkan jumlah server (1-10):" "$BLUE"
+        info "$(t "Enter number of servers (1-10):" "Masukkan jumlah server (1-10):")" "$BLUE"
         read -r jumlah_server
         if [[ "$jumlah_server" =~ ^[0-9]+$ ]] && [ "$jumlah_server" -ge 1 ] && [ "$jumlah_server" -le 10 ]; then
             break
         else
-            warning "Masukkan angka 1-10"
+            warning "$(t "Please enter a number between 1-10" "Masukkan angka 1-10")"
         fi
     done
     
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     local min_ram_needed=$((jumlah_server * MIN_RAM_PER_SERVER))
     if [ "$total_ram" -lt "$min_ram_needed" ]; then
-        warning "RAM mungkin tidak cukup: ${total_ram}MB total, minimal ${min_ram_needed}MB"
-        info "Lanjutkan? [y/N]" "$BLUE"
+        warning "$(t "RAM might be insufficient: ${total_ram}MB total, minimum ${min_ram_needed}MB needed" "RAM mungkin tidak cukup: ${total_ram}MB total, minimal ${min_ram_needed}MB diperlukan")"
+        info "$(t "Continue? [y/N]" "Lanjutkan? [y/N]")" "$BLUE"
         read -r continue_anyway
         if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
             exit 0
@@ -373,7 +410,7 @@ setup_user_and_folders() {
     fi
     
     mkdir -p /home/minecraft
-    success "Folder structure ready"
+    success "$(t "Folder structure ready" "Struktur folder siap")"
 }
 
 # Fungsi untuk input konfigurasi server
@@ -381,10 +418,10 @@ get_server_config() {
     local server_index=$1
     
     echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    info "Konfigurasi Server #$server_index" "$PURPLE"
+    info "$(t "Configuration for Server #$server_index" "Konfigurasi Server #$server_index")" "$PURPLE"
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
-    info "Nama server (default: Server$server_index):" "$BLUE"
+    info "$(t "Server name (default: Server$server_index):" "Nama server (default: Server$server_index):")" "$BLUE"
     read -r server_name
     [ -z "$server_name" ] && server_name="Server$server_index"
     
@@ -392,16 +429,16 @@ get_server_config() {
     [ -z "$folder_name" ] && folder_name="server$server_index"
     
     if [ -d "/home/minecraft/$folder_name" ]; then
-        warning "Folder /home/minecraft/$folder_name sudah ada"
-        info "Pilih: [1] overwrite [2] rename [3] skip" "$BLUE"
+        warning "$(t "Folder" "Folder") /home/minecraft/$folder_name $(t "already exists" "sudah ada")"
+        info "$(t "Choose: [1] overwrite [2] rename [3] skip" "Pilih: [1] overwrite [2] rename [3] skip")" "$BLUE"
         read -r choice
         case $choice in
             1)
-                warning "Overwrite folder..."
+                warning "$(t "Overwriting folder..." "Overwrite folder...")"
                 rm -rf "/home/minecraft/$folder_name"
                 ;;
             2)
-                info "Nama folder baru:" "$BLUE"
+                info "$(t "New folder name:" "Nama folder baru:")" "$BLUE"
                 read -r folder_name
                 folder_name=$(sanitize_folder_name "$folder_name")
                 [ -z "$folder_name" ] && folder_name="server$server_index-alt"
@@ -410,29 +447,29 @@ get_server_config() {
                 return 1
                 ;;
             *)
-                error "Pilihan tidak valid, skip"
+                error "$(t "Invalid choice, skipping" "Pilihan tidak valid, skip")"
                 return 1
                 ;;
         esac
     fi
     
-    info "Nama world (default: $folder_name):" "$BLUE"
+    info "$(t "World name (default: $folder_name):" "Nama world (default: $folder_name):")" "$BLUE"
     read -r level_name
     [ -z "$level_name" ] && level_name="$folder_name"
     
-    info "Seed (kosongkan untuk random):" "$BLUE"
+    info "$(t "Seed (leave empty for random):" "Seed (kosongkan untuk random):")" "$BLUE"
     read -r level_seed
     
     local default_port=$((19132 + server_index - 1))
     while true; do
-        info "Port server (default: $default_port):" "$BLUE"
+        info "$(t "Server port (default: $default_port):" "Port server (default: $default_port):")" "$BLUE"
         read -r server_port
         [ -z "$server_port" ] && server_port=$default_port
         
         if validate_port "$server_port"; then
             break
         else
-            warning "Port harus 1024-65535"
+            warning "$(t "Port must be 1024-65535" "Port harus 1024-65535")"
         fi
     done
     
@@ -440,11 +477,11 @@ get_server_config() {
     
     local server_portv6=$((server_port + 1))
     
-    info "Pilih gamemode:" "$BLUE"
+    info "$(t "Choose gamemode:" "Pilih gamemode:")" "$BLUE"
     echo "  0) survival"
     echo "  1) creative"
     echo "  2) adventure"
-    info "Pilihan (default: 0):" "$BLUE"
+    info "$(t "Choice (default: 0):" "Pilihan (default: 0):")" "$BLUE"
     read -r gamemode_choice
     case $gamemode_choice in
         1) gamemode="creative" ;;
@@ -452,12 +489,12 @@ get_server_config() {
         *) gamemode="survival" ;;
     esac
     
-    info "Pilih difficulty:" "$BLUE"
+    info "$(t "Choose difficulty:" "Pilih difficulty:")" "$BLUE"
     echo "  0) peaceful"
     echo "  1) easy"
     echo "  2) normal"
     echo "  3) hard"
-    info "Pilihan (default: 2):" "$BLUE"
+    info "$(t "Choice (default: 2):" "Pilihan (default: 2):")" "$BLUE"
     read -r difficulty_choice
     case $difficulty_choice in
         0) difficulty="peaceful" ;;
@@ -466,14 +503,14 @@ get_server_config() {
         *) difficulty="normal" ;;
     esac
     
-    info "Aktifkan cheats? [0] false [1] true (default: 0):" "$BLUE"
+    info "$(t "Enable cheats? [0] false [1] true (default: 0):" "Aktifkan cheats? [0] false [1] true (default: 0):")" "$BLUE"
     read -r cheats_choice
     allow_cheats=$([ "$cheats_choice" == "1" ] && echo "true" || echo "false")
     
     if command -v ufw &> /dev/null; then
         if ufw status | grep -q "Status: active"; then
             ufw allow "$server_port/udp" 2>/dev/null
-            success "Firewall port $server_port/udp dibuka"
+            success "$(t "Firewall port" "Firewall port") $server_port/udp $(t "opened" "dibuka")"
         fi
     fi
     
@@ -484,14 +521,14 @@ get_server_config() {
 
 # Fungsi untuk memilih versi server
 select_version() {
-    info "Memilih versi server..."
+    info "$(t "Selecting server version..." "Memilih versi server...")"
     
     while true; do
-        info "Masukkan versi (contoh: 1.21.114.1) atau 'latest':" "$BLUE"
+        info "$(t "Enter version (example: 1.21.114.1) or 'latest':" "Masukkan versi (contoh: 1.21.114.1) atau 'latest':")" "$BLUE"
         read -r version
         
         if [ "$version" == "latest" ]; then
-            info "Mencari versi terbaru..."
+            info "$(t "Looking for latest version..." "Mencari versi terbaru...")"
             
             latest_url=$(curl -A "Mozilla/5.0" -s "https://net-secondary.web.minecraft-services.net/api/v1.0/download/links" | 
                         grep -o '"downloadUrl":"[^"]*serverBedrockLinux[^"]*"' | 
@@ -500,24 +537,24 @@ select_version() {
             
             if [ -n "$latest_url" ]; then
                 version=$(echo "$latest_url" | grep -o 'bedrock-server-[0-9.]*\.zip' | sed 's/bedrock-server-//;s/\.zip//')
-                success "Versi terbaru: $version"
+                success "$(t "Latest version:" "Versi terbaru:") $version"
                 download_url="$latest_url"
                 break
             else
-                error "Gagal dapat versi terbaru"
+                error "$(t "Failed to get latest version" "Gagal dapat versi terbaru")"
                 continue
             fi
         else
             download_url="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-$version.zip"
         fi
         
-        info "Memeriksa versi $version..."
+        info "$(t "Checking version" "Memeriksa versi") $version..."
         
         if curl -A "Mozilla/5.0" --output /dev/null --silent --head --fail --connect-timeout 10 "$download_url"; then
-            success "Versi $version tersedia"
+            success "$(t "Version" "Versi") $version $(t "available" "tersedia")"
             break
         else
-            error "Versi $version tidak ditemukan"
+            error "$(t "Version" "Versi") $version $(t "not found" "tidak ditemukan")"
         fi
     done
     
@@ -529,17 +566,17 @@ setup_server() {
     local config=$1
     IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
     
-    info "Setup server: $server_name"
+    info "$(t "Setting up server:" "Setup server:") $server_name"
     
-    cd /home/minecraft || error_exit "Cannot cd to /home/minecraft"
+    cd /home/minecraft || error_exit "$(t "Cannot cd to /home/minecraft" "Tidak bisa masuk ke /home/minecraft")"
     
     mkdir -p "$folder_name"
-    cd "$folder_name" || error_exit "Cannot cd to $folder_name"
+    cd "$folder_name" || error_exit "$(t "Cannot cd to" "Tidak bisa masuk ke") $folder_name"
     
     [ -f "server.properties" ] && cp "server.properties" "server.properties.backup.$(date +%Y%m%d-%H%M%S)"
     
     if [ ! -f "bedrock_server" ]; then
-        info "Download server files..."
+        info "$(t "Downloading server files..." "Mendownload file server...")"
         
         local max_retries=3
         local retry=0
@@ -551,34 +588,34 @@ setup_server() {
                  "$DOWNLOAD_URL" && break
             
             retry=$((retry + 1))
-            [ $retry -lt $max_retries ] && warning "Retry $retry/$max_retries..."
+            [ $retry -lt $max_retries ] && warning "$(t "Retry" "Ulang") $retry/$max_retries..."
         done
         
         if [ ! -f "bedrock-server.zip" ]; then
-            error "Download gagal setelah $max_retries percobaan"
+            error "$(t "Download failed after" "Download gagal setelah") $max_retries $(t "attempts" "percobaan")"
             return 1
         fi
         
         local file_size=$(stat -c%s "bedrock-server.zip" 2>/dev/null || stat -f%z "bedrock-server.zip" 2>/dev/null)
         if [ -z "$file_size" ] || [ "$file_size" -lt 50000000 ]; then
-            error "File corrupted (size: $file_size bytes)"
+            error "$(t "File corrupted (size:" "File corrupted (ukuran:") $file_size $(t "bytes)" "bytes)")"
             rm -f "bedrock-server.zip"
             return 1
         fi
         
-        info "Extracting..."
+        info "$(t "Extracting..." "Mengekstrak...")"
         unzip -o bedrock-server.zip || {
-            error "Extract failed"
+            error "$(t "Extract failed" "Ekstrak gagal")"
             return 1
         }
         rm bedrock-server.zip
     else
-        success "Server files already exist"
+        success "$(t "Server files already exist" "File server sudah ada")"
     fi
     
     chmod +x bedrock_server
     
-    info "Creating server.properties..."
+    info "$(t "Creating server.properties..." "Membuat server.properties...")"
     cat > server.properties << EOF
 # Minecraft Bedrock Server Properties
 server-name=$server_name
@@ -605,32 +642,48 @@ compression-threshold=1
 compression-algorithm=zlib
 EOF
     
-    success "Server $server_name siap"
+    success "$(t "Server" "Server") $server_name $(t "ready" "siap")"
     return 0
 }
 
-# Fungsi untuk membuat systemd service
+# Fungsi untuk mendapatkan username dari folder
+get_username_from_folder() {
+    local folder=$1
+    local num=$(echo "$folder" | grep -o '[0-9]*' | head -1)
+    if [ -n "$num" ]; then
+        echo "mcserver$num"
+    else
+        echo "mcserver1"
+    fi
+}
+
+# Fungsi untuk membuat systemd service (FIXED VERSION with tmux)
 create_systemd() {
     local config=$1
     IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
     
     local service_name="$folder_name.service"
     local service_file="/etc/systemd/system/$service_name"
-    local username="mcserver$(echo $folder_name | grep -o '[0-9]*' | head -1)"
-    [ -z "$username" ] && username="mcserver1"
+    local username=$(get_username_from_folder "$folder_name")
     
-    info "Membuat systemd service untuk $server_name..."
+    info "$(t "Creating systemd service for" "Membuat systemd service untuk") $server_name..."
     
+    # Verify user exists
     if ! id "$username" &>/dev/null; then
-        error "User $username tidak ditemukan! Membuat user..."
+        error "$(t "User" "User") $username $(t "not found! Creating user..." "tidak ditemukan! Membuat user...")"
         temp_pass=$(generate_password)
         setup_minecraft_user "$username" "$temp_pass" "$folder_name"
     fi
+    
+    # Set proper permissions
+    chown -R "$username:$username" "/home/minecraft/$folder_name"
+    chmod -R 755 "/home/minecraft/$folder_name"
     
     local total_ram=$(free -m | awk '/Mem:/ {print $2}')
     local ram_per_server=$((total_ram / jumlah_server))
     [ $ram_per_server -gt 2048 ] && ram_per_server=2048
     
+    # FIXED: Using tmux for stability and adding Environment variables
     cat > "$service_file" << EOF
 [Unit]
 Description=Minecraft Bedrock Server - $server_name
@@ -639,15 +692,17 @@ StartLimitInterval=60
 StartLimitBurst=3
 
 [Service]
-Type=simple
+Type=forking
 User=$username
 Group=$username
+Environment=HOME=/home/minecraft/$folder_name
+Environment=USER=$username
 WorkingDirectory=/home/minecraft/$folder_name
-ExecStart=/bin/bash -c 'cd /home/minecraft/$folder_name && exec ./bedrock_server'
-ExecStop=/bin/kill -TERM \$MAINPID
-ExecReload=/bin/kill -HUP \$MAINPID
+ExecStart=/usr/bin/tmux new-session -d -s $username -c /home/minecraft/$folder_name '/home/minecraft/$folder_name/bedrock_server'
+ExecStop=/usr/bin/tmux kill-session -t $username
+ExecReload=/usr/bin/tmux send-keys -t $username 'reload' C-m
 Restart=always
-RestartSec=5
+RestartSec=10
 Nice=10
 CPUQuota=80%
 MemoryLimit=${ram_per_server}M
@@ -663,10 +718,10 @@ WantedBy=multi-user.target
 EOF
     
     if [ -f "$service_file" ]; then
-        success "Service $service_name dibuat"
-        systemd-analyze verify "$service_file" 2>/dev/null || warning "Service file has warnings"
+        success "$(t "Service" "Service") $service_name $(t "created" "dibuat")"
+        systemd-analyze verify "$service_file" 2>/dev/null || warning "$(t "Service file has warnings" "File service memiliki peringatan")"
     else
-        error "Gagal membuat service file"
+        error "$(t "Failed to create service file" "Gagal membuat file service")"
     fi
 }
 
@@ -677,36 +732,40 @@ enable_service() {
     
     local service_name="$folder_name.service"
     
-    info "Enable service $service_name..."
+    info "$(t "Enabling service" "Mengaktifkan service") $service_name..."
     systemctl daemon-reload
-    systemctl enable "$service_name" || error "Gagal enable service"
-    success "Service enabled"
+    systemctl enable "$service_name" || error "$(t "Failed to enable service" "Gagal enable service")"
+    success "$(t "Service enabled" "Service diaktifkan")"
 }
 
 # Fungsi untuk start semua server dengan delay
 start_all_servers() {
-    info "Starting all servers..."
+    info "$(t "Starting all servers..." "Menjalankan semua server...")"
     
     local index=1
     for config in "${server_configs[@]}"; do
         IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
         
-        info "Starting $server_name (port $server_port)..."
+        info "$(t "Starting" "Menjalankan") $server_name ($(t "port" "port") $server_port)..."
         systemctl start "$folder_name.service"
         
         sleep 3
         if systemctl is-active --quiet "$folder_name.service"; then
-            success "$server_name running"
-            pgrep -f "bedrock_server.*$folder_name" > /dev/null && \
-                success "Process ID: $(pgrep -f "bedrock_server.*$folder_name")"
+            success "$server_name $(t "running" "berjalan")"
+            
+            # Check tmux session
+            local username=$(get_username_from_folder "$folder_name")
+            if tmux has-session -t "$username" 2>/dev/null; then
+                success "Tmux session: $username"
+            fi
         else
-            error "$server_name failed to start"
-            warning "Check logs: journalctl -u $folder_name.service -n 20"
+            error "$server_name $(t "failed to start" "gagal start")"
+            warning "$(t "Check logs:" "Cek log:") journalctl -u $folder_name.service -n 20"
             journalctl -u "$folder_name.service" --no-pager -n 5
         fi
         
         if [ $index -lt ${#server_configs[@]} ]; then
-            info "Waiting 5 seconds..."
+            info "$(t "Waiting 5 seconds..." "Menunggu 5 detik...")"
             sleep 5
         fi
         
@@ -718,65 +777,69 @@ start_all_servers() {
 cleanup_total() {
     clear_screen
     echo -e "\n${RED}══════════════════════════════════════════════════════════${NC}"
-    error "⚠️  TOTAL CLEANUP - MENGHAPUS SEMUA!  ⚠️"
+    error "⚠️  $(t "TOTAL CLEANUP - DELETING EVERYTHING!" "TOTAL CLEANUP - MENGHAPUS SEMUA!")  ⚠️"
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
-    error "Ini akan menghapus:"
-    error "  • Semua Minecraft servers"
-    error "  • Semua user (mcserver*)"
-    error "  • Semua systemd services"
-    error "  • Semua bind mounts"
-    error "  • Semua konfigurasi SSH terkait"
-    error "  • Semua file di /home/minecraft/"
-    error "  • Semua file di /home/mcserver*/"
+    error "$(t "This will delete:" "Ini akan menghapus:")"
+    error "  • $(t "All Minecraft servers" "Semua Minecraft servers")"
+    error "  • $(t "All users (mcserver*)" "Semua user (mcserver*)")"
+    error "  • $(t "All systemd services" "Semua systemd services")"
+    error "  • $(t "All bind mounts" "Semua bind mounts")"
+    error "  • $(t "All SSH configurations" "Semua konfigurasi SSH")"
     echo
-    warning "Ketik 'TOTAL-DELETE' untuk konfirmasi:"
+    warning "$(t "Type 'TOTAL-DELETE' to confirm:" "Ketik 'TOTAL-DELETE' untuk konfirmasi:")"
     read -r confirmation
     
     if [ "$confirmation" != "TOTAL-DELETE" ]; then
-        warning "Total cleanup dibatalkan"
+        warning "$(t "Total cleanup cancelled" "Total cleanup dibatalkan")"
         cleanup_menu
         return
     fi
     
-    info "Memulai total cleanup..."
+    info "$(t "Starting total cleanup..." "Memulai total cleanup...")"
     
     # Stop all services
-    info "Stopping all services..."
+    info "$(t "Stopping all services..." "Menghentikan semua service...")"
     for service in /etc/systemd/system/mcserver*.service /etc/systemd/system/*.service; do
         if [ -f "$service" ] && grep -q "Minecraft Bedrock" "$service" 2>/dev/null; then
             service_name=$(basename "$service")
             systemctl stop "$service_name" 2>/dev/null
             systemctl disable "$service_name" 2>/dev/null
             rm -f "$service"
-            success "Removed service: $service_name"
+            success "$(t "Removed service:" "Menghapus service:") $service_name"
         fi
     done
     
+    # Kill all tmux sessions
+    info "$(t "Killing tmux sessions..." "Mematikan tmux sessions...")"
+    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
+        tmux kill-session -t "$user" 2>/dev/null
+    done
+    
     # Remove all bind mounts from fstab
-    info "Cleaning fstab..."
+    info "$(t "Cleaning fstab..." "Membersihkan fstab...")"
     sed -i "\|/home/minecraft|d" /etc/fstab
     sed -i "\|/home/mcserver|d" /etc/fstab
     
     # Unmount all bind mounts
-    info "Unmounting all bind mounts..."
+    info "$(t "Unmounting all bind mounts..." "Unmount semua bind mounts...")"
     mount | grep "/home/mcserver" | awk '{print $3}' | xargs -r umount -f 2>/dev/null
     mount | grep "/home/minecraft" | grep -v "/home/minecraft$" | awk '{print $3}' | xargs -r umount -f 2>/dev/null
     
     # Remove all Minecraft users
-    info "Removing all Minecraft users..."
+    info "$(t "Removing all Minecraft users..." "Menghapus semua Minecraft users...")"
     for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
         pkill -u "$user" 2>/dev/null
         userdel -r "$user" 2>/dev/null
-        success "Removed user: $user"
+        success "$(t "Removed user:" "Menghapus user:") $user"
     done
     
     # Remove Minecraft directories
-    info "Removing Minecraft directories..."
+    info "$(t "Removing Minecraft directories..." "Menghapus direktori Minecraft...")"
     rm -rf /home/minecraft
     rm -rf /home/mcserver* 2>/dev/null
     
     # Clean SSH config from any custom settings
-    info "Cleaning SSH configuration..."
+    info "$(t "Cleaning SSH configuration..." "Membersihkan konfigurasi SSH...")"
     local sshd_config="/etc/ssh/sshd_config"
     sed -i '/# Minecraft user configurations/,/^$/d' "$sshd_config"
     
@@ -787,10 +850,10 @@ cleanup_total() {
     systemctl daemon-reload
     systemctl restart sshd
     
-    success "✅ Total cleanup selesai! Semua telah dihapus."
-    info "Sistem kembali ke keadaan awal sebelum instalasi Minecraft."
+    success "✅ $(t "Total cleanup complete! Everything has been removed." "Total cleanup selesai! Semua telah dihapus.")"
+    info "$(t "System returned to pre-installation state." "Sistem kembali ke keadaan sebelum instalasi.")"
     
-    read -p "Press Enter to continue..."
+    read -p "$(t "Press Enter to continue..." "Tekan Enter untuk melanjutkan...")"
     show_main_menu
 }
 
@@ -798,15 +861,15 @@ cleanup_total() {
 cleanup_menu() {
     clear_screen
     echo -e "\n${RED}══════════════════════════════════════════════════════════${NC}"
-    info "CLEANUP MENU" "$RED"
+    info "$(t "CLEANUP MENU" "MENU CLEANUP")" "$RED"
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
     
-    echo "  1) Clean specific server"
-    echo "  2) Clean ALL servers and users (TOTAL CLEANUP)"
-    echo "  3) Clean orphaned users (no server)"
-    echo "  4) Back to main menu"
+    echo "  1) $(t "Clean specific server" "Bersihkan server tertentu")"
+    echo "  2) $(t "Clean ALL servers and users (TOTAL CLEANUP)" "Bersihkan SEMUA server dan user (TOTAL CLEANUP)")"
+    echo "  3) $(t "Clean orphaned users (no server)" "Bersihkan user yatim (tanpa server)")"
+    echo "  4) $(t "Back to main menu" "Kembali ke menu utama")"
     
-    info "Pilihan (1-4):" "$BLUE"
+    info "$(t "Choice (1-4):" "Pilihan (1-4):")" "$BLUE"
     read -r cleanup_choice
     
     case $cleanup_choice in
@@ -814,13 +877,13 @@ cleanup_menu() {
         2) cleanup_total ;;
         3) cleanup_orphaned_users ;;
         4) show_main_menu ;;
-        *) error "Pilihan tidak valid!"; sleep 2; cleanup_menu ;;
+        *) error "$(t "Invalid choice!" "Pilihan tidak valid!")"; sleep 2; cleanup_menu ;;
     esac
 }
 
 # Fungsi untuk cleanup server spesifik
 cleanup_specific_server() {
-    echo -e "\n${YELLOW}Available servers:${NC}"
+    echo -e "\n${YELLOW}$(t "Available servers:" "Server tersedia:")${NC}"
     local servers=()
     local i=1
     
@@ -834,18 +897,18 @@ cleanup_specific_server() {
     done
     
     if [ ${#servers[@]} -eq 0 ]; then
-        error "No servers found"
+        error "$(t "No servers found" "Tidak ada server ditemukan")"
         sleep 2
         cleanup_menu
         return
     fi
     
     echo
-    info "Pilih server yang akan di-clean (nomor):" "$BLUE"
+    info "$(t "Choose server to clean (number):" "Pilih server yang akan dibersihkan (nomor):")" "$BLUE"
     read -r server_choice
     
     if ! [[ "$server_choice" =~ ^[0-9]+$ ]] || [ "$server_choice" -lt 1 ] || [ "$server_choice" -gt ${#servers[@]} ]; then
-        error "Pilihan tidak valid"
+        error "$(t "Invalid choice" "Pilihan tidak valid")"
         cleanup_menu
         return
     fi
@@ -853,12 +916,12 @@ cleanup_specific_server() {
     local selected_server="${servers[$((server_choice-1))]}"
     
     echo
-    error "⚠️ PERINGATAN! Menghapus server: $selected_server"
-    info "Ketik 'DELETE' untuk konfirmasi:" "$BLUE"
+    error "⚠️ $(t "WARNING! Deleting server:" "PERINGATAN! Menghapus server:") $selected_server"
+    info "$(t "Type 'DELETE' to confirm:" "Ketik 'DELETE' untuk konfirmasi:")" "$BLUE"
     read -r confirmation
     
     if [ "$confirmation" != "DELETE" ]; then
-        warning "Cleanup dibatalkan"
+        warning "$(t "Cleanup cancelled" "Cleanup dibatalkan")"
         cleanup_menu
         return
     fi
@@ -872,9 +935,12 @@ cleanup_specific_server() {
     sed -i "\|/home/minecraft/$selected_server|d" /etc/fstab
     
     # Find and remove related user
-    local username="mcserver$(echo $selected_server | grep -o '[0-9]*' | head -1)"
+    local username=$(get_username_from_folder "$selected_server")
     if id "$username" &>/dev/null; then
-        info "Removing user $username..."
+        info "$(t "Removing user" "Menghapus user") $username..."
+        
+        # Kill tmux session
+        tmux kill-session -t "$username" 2>/dev/null
         
         # Unmount bind mounts
         umount "/home/$username/minecraft" 2>/dev/null
@@ -885,7 +951,7 @@ cleanup_specific_server() {
         
         # Remove user
         userdel -r "$username" 2>/dev/null
-        success "Removed user $username"
+        success "$(t "Removed user" "User dihapus") $username"
     fi
     
     # Remove server folder
@@ -893,14 +959,14 @@ cleanup_specific_server() {
     
     systemctl daemon-reload
     
-    success "Server $selected_server cleaned up!"
+    success "$(t "Server" "Server") $selected_server $(t "cleaned up!" "dibersihkan!")"
     sleep 2
     cleanup_menu
 }
 
 # Fungsi untuk cleanup orphaned users
 cleanup_orphaned_users() {
-    info "Looking for orphaned users..."
+    info "$(t "Looking for orphaned users..." "Mencari user yatim...")"
     
     local found=0
     for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
@@ -914,19 +980,20 @@ cleanup_orphaned_users() {
         done
         
         if [ $has_server -eq 0 ]; then
-            warning "Found orphaned user: $user"
+            warning "$(t "Found orphaned user:" "Ditemukan user yatim:") $user"
             
+            tmux kill-session -t "$user" 2>/dev/null
             umount "/home/$user/minecraft" 2>/dev/null
             sed -i "\|/home/$user|d" /etc/fstab
             pkill -u "$user" 2>/dev/null
             userdel -r "$user" 2>/dev/null
-            success "Removed orphaned user $user"
+            success "$(t "Removed orphaned user" "User yatim dihapus") $user"
             found=1
         fi
     done
     
     if [ $found -eq 0 ]; then
-        success "No orphaned users found"
+        success "$(t "No orphaned users found" "Tidak ada user yatim ditemukan")"
     fi
     
     sleep 2
@@ -937,7 +1004,7 @@ cleanup_orphaned_users() {
 list_all_servers() {
     clear_screen
     echo -e "\n${CYAN}══════════════════════════════════════════════════════════${NC}"
-    info "ALL SERVERS" "$PURPLE"
+    info "$(t "ALL SERVERS" "SEMUA SERVER")" "$PURPLE"
     echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
     
     local found=0
@@ -948,42 +1015,46 @@ list_all_servers() {
             
             if [ -f "$dir/bedrock_server" ]; then
                 if systemctl is-active --quiet "$server_name.service" 2>/dev/null; then
-                    status="${GREEN}● RUNNING${NC}"
-                    pid=$(pgrep -f "bedrock_server.*$server_name" | head -1)
+                    status="${GREEN}● $(t "RUNNING" "BERJALAN")${NC}"
+                    pid=$(pgrep -f "bedrock_server" | head -1)
                     [ -n "$pid" ] && pid_info=" (PID: $pid)" || pid_info=""
                 else
-                    status="${RED}○ STOPPED${NC}"
+                    status="${RED}○ $(t "STOPPED" "BERHENTI")${NC}"
                     pid_info=""
                 fi
             else
-                status="${YELLOW}○ INCOMPLETE${NC}"
+                status="${YELLOW}○ $(t "INCOMPLETE" "TIDAK LENGKAP")${NC}"
                 pid_info=""
             fi
             
             port=$(grep "^server-port=" "$dir/server.properties" 2>/dev/null | cut -d'=' -f2)
             
             # Get associated user
-            username="mcserver$(echo $server_name | grep -o '[0-9]*' | head -1)"
+            username=$(get_username_from_folder "$server_name")
             if id "$username" &>/dev/null; then
                 user_info="$username"
+                # Check tmux session
+                if tmux has-session -t "$username" 2>/dev/null; then
+                    user_info="$username (tmux)"
+                fi
             else
                 user_info="none"
             fi
             
             echo -e "\n${PURPLE}📁 $server_name${NC}"
-            echo -e "  Status  : $status$pid_info"
-            echo -e "  Port    : ${port:-N/A}"
-            echo -e "  User    : $user_info"
-            echo -e "  Path    : $dir"
+            echo -e "  $(t "Status" "Status")  : $status$pid_info"
+            echo -e "  $(t "Port" "Port")    : ${port:-N/A}"
+            echo -e "  $(t "User" "User")    : $user_info"
+            echo -e "  $(t "Path" "Path")    : $dir"
         fi
     done
     
     if [ $found -eq 0 ]; then
-        error "No Minecraft servers found"
+        error "$(t "No Minecraft servers found" "Tidak ada Minecraft server ditemukan")"
     fi
     
     echo
-    info "Press Enter to continue..." "$BLUE"
+    info "$(t "Press Enter to continue..." "Tekan Enter untuk melanjutkan...")" "$BLUE"
     read -r
     show_main_menu
 }
@@ -992,15 +1063,15 @@ list_all_servers() {
 show_main_menu() {
     clear_screen
     echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
-    info "MAIN MENU" "$PURPLE"
+    info "$(t "MAIN MENU" "MENU UTAMA")" "$PURPLE"
     echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
-    echo "  1) Install new Minecraft server(s)"
-    echo "  2) Uninstall existing server"
-    echo "  3) List all servers"
-    echo "  4) Cleanup menu"
-    echo "  5) Exit"
+    echo "  1) $(t "Install new Minecraft server(s)" "Install server Minecraft baru")"
+    echo "  2) $(t "Uninstall existing server" "Uninstall server yang ada")"
+    echo "  3) $(t "List all servers" "Lihat semua server")"
+    echo "  4) $(t "Cleanup menu" "Menu pembersihan")"
+    echo "  5) $(t "Exit" "Keluar")"
     echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
-    info "Pilihan (1-5):" "$BLUE"
+    info "$(t "Choice (1-5):" "Pilihan (1-5):")" "$BLUE"
     read -r menu_choice
     
     case $menu_choice in
@@ -1009,14 +1080,14 @@ show_main_menu() {
         3) list_all_servers ;;
         4) cleanup_menu ;;
         5) exit 0 ;;
-        *) error "Pilihan tidak valid!"; sleep 2; show_main_menu ;;
+        *) error "$(t "Invalid choice!" "Pilihan tidak valid!")"; sleep 2; show_main_menu ;;
     esac
 }
 
 # Fungsi untuk install new servers
 install_new_servers() {
     clear_screen
-    info "Starting new server installation..."
+    info "$(t "Starting new server installation..." "Memulai instalasi server baru...")"
     
     check_resources
     check_dependencies
@@ -1033,7 +1104,7 @@ install_new_servers() {
     done
     
     if [ ${#server_configs[@]} -eq 0 ]; then
-        error_exit "Tidak ada server yang dikonfigurasi"
+        error_exit "$(t "No servers configured" "Tidak ada server yang dikonfigurasi")"
     fi
     
     select_version
@@ -1046,13 +1117,14 @@ install_new_servers() {
     done
     
     if [ $success_count -eq 0 ]; then
-        error_exit "Tidak ada server yang berhasil diinstall"
+        error_exit "$(t "No servers were successfully installed" "Tidak ada server yang berhasil diinstall")"
     fi
     
     # Set ownership setelah server diinstall
     for user_info in "${server_users[@]}"; do
         IFS='|' read -r username password server_folder <<< "$user_info"
         chown -R "$username:$username" "/home/minecraft/$server_folder"
+        chmod -R 755 "/home/minecraft/$server_folder"
     done
     
     for config in "${server_configs[@]}"; do
@@ -1065,46 +1137,46 @@ install_new_servers() {
     
     # Display credentials
     echo -e "\n${GREEN}══════════════════════════════════════════════════════════${NC}"
-    info "SERVER ACCESS CREDENTIALS" "$PURPLE"
+    info "$(t "SERVER ACCESS CREDENTIALS" "KREDENSIAL AKSES SERVER")" "$PURPLE"
     echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
     
     local ip_address=$(hostname -I | awk '{print $1}')
     for user_info in "${server_users[@]}"; do
         IFS='|' read -r username password server_folder <<< "$user_info"
         
-        echo -e "\n${CYAN}Server: $server_folder${NC}"
-        echo -e "  Username     : $username"
-        echo -e "  Password     : ${YELLOW}$password${NC}"
-        echo -e "  SSH Command  : ssh $username@$ip_address -p $SSH_PORT"
+        echo -e "\n${CYAN}$(t "Server:" "Server:") $server_folder${NC}"
+        echo -e "  $(t "Username" "Username")     : $username"
+        echo -e "  $(t "Password" "Password")     : ${YELLOW}$password${NC}"
+        echo -e "  SSH $(t "Command" "Perintah")  : ssh $username@$ip_address -p $SSH_PORT"
         echo -e "  SFTP URL     : sftp://$username@$ip_address:$SSH_PORT"
-        echo -e "  Server Path  : /home/$username/minecraft/ (auto-cd on login)"
-        echo -e "  Direct Path  : /home/minecraft/$server_folder/"
+        echo -e "  $(t "Server Path" "Path Server")  : /home/$username/minecraft/ ($(t "auto-cd on login" "auto-cd saat login"))"
     done
     
-    echo -e "\n${RED}⚠ IMPORTANT: Save these passwords! They won't be shown again.${NC}"
+    echo -e "\n${RED}⚠ $(t "IMPORTANT: Save these passwords! They won't be shown again." "PENTING: Simpan password ini! Tidak akan ditampilkan lagi.")${NC}"
     
-    info "\nStart semua server sekarang? [y/N]" "$BLUE"
+    info "$(t "Start all servers now? [y/N]" "Jalankan semua server sekarang? [y/N]")" "$BLUE"
     read -r start_now
     if [[ "$start_now" =~ ^[Yy]$ ]]; then
         start_all_servers
     fi
     
-    info "\nTekan Enter untuk kembali ke menu..." "$GREEN"
+    info "$(t "Press Enter to return to menu..." "Tekan Enter untuk kembali ke menu...")" "$GREEN"
     read -r
     show_main_menu
 }
 
 # Trap for cleanup
-trap 'error "Script interrupted!"; exit 1' INT TERM
+trap 'error "$(t "Script interrupted!" "Script terinterupsi!")"; exit 1' INT TERM
 
 # Fungsi utama
 main() {
     clear_screen
     
     if [ "$EUID" -ne 0 ]; then 
-        error_exit "Script harus dijalankan sebagai root"
+        error_exit "$(t "Script must be run as root" "Script harus dijalankan sebagai root")"
     fi
     
+    select_language
     show_main_menu
 }
 
