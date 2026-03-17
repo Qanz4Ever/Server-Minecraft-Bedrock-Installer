@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Auto Installer v5.2 - Enterprise Edition
-# Dengan True Chroot Jail + Uninstaller + Cleanup Menu + Console Clear
+# Minecraft Bedrock Server Auto Installer v5.3 - Enterprise Edition
+# Dengan True Chroot Jail + SSH Restriction
 
 # Warna untuk output
 RED='\033[0;31m'
@@ -14,11 +14,11 @@ WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Konfigurasi global
-SCRIPT_VERSION="5.2"
+SCRIPT_VERSION="5.3"
 MIN_DISK_SPACE=1024  # MB
 MIN_RAM_PER_SERVER=512  # MB
 SSH_PORT=22
-CHROOT_BASE="/var/chroot"
+JAIL_BASE="/home"
 
 # Fungsi untuk clear screen dengan banner
 clear_screen() {
@@ -26,17 +26,7 @@ clear_screen() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - True Chroot Jail)         ║"
-    echo "╚══════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
-
-# Fungsi untuk menampilkan banner
-show_banner() {
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - True Chroot Jail)         ║"
+    echo "║         (Enterprise Edition - SSH Restricted)           ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -100,7 +90,7 @@ check_resources() {
 check_dependencies() {
     info "Memeriksa dependencies..."
     
-    local deps=("unzip" "curl" "tmux" "systemctl" "chmod" "lsof" "ufw" "wget" "bc" "openssh-server" "openssl")
+    local deps=("unzip" "curl" "tmux" "systemctl" "chmod" "lsof" "ufw" "wget" "bc" "openssh-server" "openssl" "tmux")
     local install_packages=()
     
     for dep in "${deps[@]}"; do
@@ -127,130 +117,102 @@ check_dependencies() {
         apt update && apt install -y ${install_packages[*]} || error_exit "Gagal install dependencies"
         success "Dependencies terinstall"
     fi
+    
+    # Configure SSH untuk restricted shell
+    setup_restricted_shell
 }
 
-# Fungsi untuk generate random password
-generate_password() {
-    openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*' | fold -w 16 | head -n 1
-}
-
-# Fungsi untuk setup true chroot jail
-setup_chroot_jail() {
-    local username=$1
-    local server_folder=$2
+# Fungsi untuk setup restricted shell (rbash)
+setup_restricted_shell() {
+    info "Setting up restricted shell (rbash)..."
     
-    info "Setting up chroot jail for $username..."
-    
-    # Create chroot base
-    local chroot_path="$CHROOT_BASE/$username"
-    mkdir -p "$chroot_path"
-    
-    # Create minimal chroot environment
-    mkdir -p "$chroot_path"/{bin,dev,etc,lib,lib64,usr,home,minecraft}
-    
-    # Copy necessary binaries and libraries for SFTP
-    cp /bin/bash "$chroot_path/bin/" 2>/dev/null
-    cp /usr/lib/openssh/sftp-server "$chroot_path/usr/bin/" 2>/dev/null || \
-    cp /usr/libexec/openssh/sftp-server "$chroot_path/usr/bin/" 2>/dev/null
-    
-    # Copy libraries
-    for lib in ld-linux*.so* libc.so* libnss_compat.so* libnss_files.so* libresolv.so*; do
-        find /lib -name "$lib" -exec cp {} "$chroot_path/lib/" 2>/dev/null \;
-        find /lib64 -name "$lib" -exec cp {} "$chroot_path/lib64/" 2>/dev/null \;
-    done
-    
-    # Copy nsswitch.conf
-    cp /etc/nsswitch.conf "$chroot_path/etc/" 2>/dev/null
-    
-    # Create passwd and group files for chroot
-    grep "^$username:" /etc/passwd > "$chroot_path/etc/passwd" 2>/dev/null
-    grep "^sftp-users:" /etc/group > "$chroot_path/etc/group" 2>/dev/null
-    
-    # Create devices
-    mknod -m 666 "$chroot_path/dev/null" c 1 3 2>/dev/null
-    mknod -m 666 "$chroot_path/dev/zero" c 1 5 2>/dev/null
-    mknod -m 666 "$chroot_path/dev/random" c 1 8 2>/dev/null
-    mknod -m 666 "$chroot_path/dev/urandom" c 1 9 2>/dev/null
-    
-    # Mount server folder to chroot
-    mkdir -p "$chroot_path/minecraft/$server_folder"
-    
-    # Bind mount (persistent)
-    if ! grep -q "$chroot_path/minecraft/$server_folder" /etc/fstab; then
-        echo "/home/minecraft/$server_folder $chroot_path/minecraft/$server_folder none bind 0 0" >> /etc/fstab
+    # Create rbash symlink if not exists
+    if [ ! -f "/bin/rbash" ]; then
+        ln -s /bin/bash /bin/rbash 2>/dev/null
+        success "rbash created"
     fi
     
-    # Mount now
-    mount --bind "/home/minecraft/$server_folder" "$chroot_path/minecraft/$server_folder" 2>/dev/null
+    # Configure SSH to allow rbash
+    local sshd_config="/etc/ssh/sshd_config"
     
-    # Set permissions
-    chown root:root "$chroot_path"
-    chmod 755 "$chroot_path"
-    chown -R "$username:sftp-users" "$chroot_path/minecraft/$server_folder" 2>/dev/null
-    
-    success "Chroot jail created at $chroot_path"
-}
-
-# Fungsi untuk setup user dengan true chroot
-setup_sftp_user() {
-    local username=$1
-    local server_folder=$2
-    local password=$3
-    
-    info "Setting up chrooted SFTP user: $username"
-    
-    # Create group if not exists
-    if ! getent group sftp-users >/dev/null; then
-        groupadd sftp-users
-        success "Group sftp-users created"
+    # Ensure AllowTcpForwarding is disabled for all
+    if grep -q "^AllowTcpForwarding" "$sshd_config"; then
+        sed -i 's/^AllowTcpForwarding.*/AllowTcpForwarding no/' "$sshd_config"
+    else
+        echo "AllowTcpForwarding no" >> "$sshd_config"
     fi
     
-    # Create user if not exists
+    systemctl restart sshd
+    success "SSH configured for restricted shell"
+}
+
+# Fungsi untuk membuat restricted user (rbash)
+create_restricted_user() {
+    local username=$1
+    local password=$2
+    local server_folder=$3
+    
+    info "Creating restricted user: $username"
+    
+    # Create user with rbash as shell
     if ! id "$username" &>/dev/null; then
-        # Create user with no shell and home in chroot
-        useradd -m -d "/home/$username" -s /usr/sbin/nologin -G sftp-users "$username"
+        useradd -m -d "/home/$username" -s /bin/rbash "$username"
         
         # Set password
         echo "$username:$password" | chpasswd
-        success "User $username created with password: $password"
+        success "User $username created with rbash shell"
         
-        # Lock the user's home (they will use chroot instead)
-        chmod 750 "/home/$username"
+        # Create restricted PATH
+        mkdir -p "/home/$username/bin"
+        
+        # Create .bashrc yang sangat terbatas
+        cat > "/home/$username/.bashrc" << 'EOF'
+# Restricted bashrc
+PATH=/home/$USER/bin
+export PATH
+PS1='[\u@\h \W]$ '
+echo "Welcome to restricted shell. Available commands: help, ls, cd, exit"
+alias ls='ls --color=auto'
+alias ll='ls -la'
+alias la='ls -a'
+EOF
+        
+        # Create allowed commands symlinks
+        local allowed_commands=("ls" "cd" "pwd" "exit" "clear" "help")
+        for cmd in "${allowed_commands[@]}"; do
+            ln -s "/bin/$cmd" "/home/$username/bin/$cmd" 2>/dev/null
+        done
+        
+        # Lock down permissions
+        chown -R "$username:$username" "/home/$username"
+        chmod 755 "/home/$username"
+        chmod 750 "/home/$username/bin"
+        
+        # SSH jail - chroot directory
+        mkdir -p "/home/$username/minecraft"
+        
+        # Bind mount server folder
+        if ! grep -q "/home/$username/minecraft/$server_folder" /etc/fstab; then
+            echo "/home/minecraft/$server_folder /home/$username/minecraft/$server_folder none bind 0 0" >> /etc/fstab
+        fi
+        
+        mount --bind "/home/minecraft/$server_folder" "/home/$username/minecraft/$server_folder" 2>/dev/null
+        
+        # Create symbolic link di home user
+        ln -s "/home/$username/minecraft/$server_folder" "/home/$username/server" 2>/dev/null
+        
+        success "Restricted environment created for $username"
     else
         warning "User $username already exists"
-        usermod -a -G sftp-users "$username"
     fi
-    
-    # Setup chroot jail
-    setup_chroot_jail "$username" "$server_folder"
-    
-    # Configure SSH for this specific user
-    local sshd_config="/etc/ssh/sshd_config"
-    
-    # Add user-specific chroot if not exists
-    if ! grep -q "Match User $username" "$sshd_config"; then
-        cat >> "$sshd_config" << EOF
-
-# Chroot jail for $username
-Match User $username
-    ChrootDirectory $CHROOT_BASE/$username
-    ForceCommand internal-sftp
-    PermitTunnel no
-    AllowAgentForwarding no
-    AllowTcpForwarding no
-    X11Forwarding no
-    PasswordAuthentication yes
-EOF
-        success "SSH chroot configuration added for $username"
-    fi
-    
-    success "Chroot SFTP setup complete for $username"
 }
 
-# Fungsi untuk setup user Minecraft (non-jail, untuk run server)
+# Fungsi untuk setup Minecraft user (untuk run server)
 setup_minecraft_user() {
     local username=$1
     local server_folder=$2
+    
+    info "Setting up Minecraft server user: $username"
     
     if ! id "$username" &>/dev/null; then
         useradd -m -s /bin/bash -d "/home/$username" "$username"
@@ -270,7 +232,7 @@ setup_user_with_password() {
     local server_index=$1
     local server_folder=$2
     local minecraft_user="mcserver$server_index"
-    local default_sftp_user="${server_folder}-sftp"
+    local restricted_user="$minecraft_user"  # Same username for both (restricted shell)
     
     echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     info "Konfigurasi User untuk Server #$server_index" "$PURPLE"
@@ -279,32 +241,27 @@ setup_user_with_password() {
     # Create Minecraft user first (for running server)
     setup_minecraft_user "$minecraft_user" "$server_folder"
     
-    # Username for SFTP
-    info "Username untuk SFTP access (default: $default_sftp_user):" "$BLUE"
-    read -r sftp_username
-    [ -z "$sftp_username" ] && sftp_username="$default_sftp_user"
-    
-    # Password
-    info "Pilih metode password:" "$BLUE"
+    # Password untuk restricted user (same as Minecraft user password)
+    info "Pilih metode password untuk $minecraft_user:" "$BLUE"
     echo "  1) Generate random password (recommended)"
     echo "  2) Masukkan password manual"
     info "Pilihan (default: 1):" "$BLUE"
     read -r password_choice
     
-    local sftp_password
+    local user_password
     case $password_choice in
         2)
             while true; do
                 info "Masukkan password (min 8 karakter):" "$BLUE"
-                read -s sftp_password
+                read -s user_password
                 echo
                 info "Konfirmasi password:" "$BLUE"
-                read -s sftp_password_confirm
+                read -s user_password_confirm
                 echo
                 
-                if [ "$sftp_password" != "$sftp_password_confirm" ]; then
+                if [ "$user_password" != "$user_password_confirm" ]; then
                     error "Password tidak cocok!"
-                elif [ ${#sftp_password} -lt 8 ]; then
+                elif [ ${#user_password} -lt 8 ]; then
                     error "Password minimal 8 karakter!"
                 else
                     break
@@ -312,16 +269,21 @@ setup_user_with_password() {
             done
             ;;
         *)
-            sftp_password=$(generate_password)
+            user_password=$(generate_password)
             success "Random password generated"
             ;;
     esac
     
     # Save user info
-    sftp_users+=("$sftp_username|$sftp_password|$server_folder")
+    server_users+=("$minecraft_user|$user_password|$server_folder")
     
-    # Setup chroot SFTP user
-    setup_sftp_user "$sftp_username" "$server_folder" "$sftp_password"
+    # Create restricted user (rbash) - same username
+    create_restricted_user "$minecraft_user" "$user_password" "$server_folder"
+}
+
+# Fungsi untuk generate random password
+generate_password() {
+    openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*' | fold -w 16 | head -n 1
 }
 
 # Fungsi untuk validasi port
@@ -402,7 +364,6 @@ setup_user_and_folders() {
     fi
     
     mkdir -p /home/minecraft
-    mkdir -p "$CHROOT_BASE"
     success "Folder structure ready"
 }
 
@@ -558,7 +519,7 @@ select_version() {
 setup_server() {
     local config=$1
     IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
-    local minecraft_user="mcserver$(echo $folder_name | tr -cd '0-9')"
+    local minecraft_user="mcserver$(echo $folder_name | grep -o '[0-9]*' | head -1)"
     [ -z "$minecraft_user" ] && minecraft_user="mcserver1"
     
     info "Setup server: $server_name"
@@ -644,14 +605,14 @@ EOF
     return 0
 }
 
-# Fungsi untuk membuat systemd service
+# Fungsi untuk membuat systemd service (FIXED VERSION)
 create_systemd() {
     local config=$1
     IFS='|' read -r server_name folder_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
     
     local service_name="$folder_name.service"
     local service_file="/etc/systemd/system/$service_name"
-    local minecraft_user="mcserver$(echo $folder_name | tr -cd '0-9')"
+    local minecraft_user="mcserver$(echo $folder_name | grep -o '[0-9]*' | head -1)"
     [ -z "$minecraft_user" ] && minecraft_user="mcserver1"
     
     info "Membuat systemd service untuk $server_name..."
@@ -666,6 +627,7 @@ create_systemd() {
     local ram_per_server=$((total_ram / jumlah_server))
     [ $ram_per_server -gt 2048 ] && ram_per_server=2048
     
+    # FIXED: Menggunakan bash -c untuk menjalankan server
     cat > "$service_file" << EOF
 [Unit]
 Description=Minecraft Bedrock Server - $server_name
@@ -678,7 +640,7 @@ Type=simple
 User=$minecraft_user
 Group=$minecraft_user
 WorkingDirectory=/home/minecraft/$folder_name
-ExecStart=/home/minecraft/$folder_name/bedrock_server
+ExecStart=/bin/bash -c 'cd /home/minecraft/$folder_name && exec ./bedrock_server'
 ExecStop=/bin/kill -TERM \$MAINPID
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
@@ -687,6 +649,7 @@ Nice=10
 CPUQuota=80%
 MemoryLimit=${ram_per_server}M
 LimitNOFILE=65535
+StandardInput=null
 StandardOutput=append:/home/minecraft/$folder_name/server.log
 StandardError=append:/home/minecraft/$folder_name/error.log
 SuccessExitStatus=0 1
@@ -734,6 +697,10 @@ start_all_servers() {
         sleep 3
         if systemctl is-active --quiet "$folder_name.service"; then
             success "$server_name running"
+            
+            # Show process info
+            pgrep -f "bedrock_server.*$folder_name" > /dev/null && \
+                success "Process ID: $(pgrep -f "bedrock_server.*$folder_name")"
         else
             error "$server_name failed to start"
             warning "Check logs: journalctl -u $folder_name.service -n 20"
@@ -759,18 +726,16 @@ cleanup_all() {
     echo "  1) Clean specific server"
     echo "  2) Clean ALL servers and users"
     echo "  3) Clean orphaned users (no server)"
-    echo "  4) Clean SSH jail configurations"
-    echo "  5) Back to main menu"
+    echo "  4) Back to main menu"
     
-    info "Pilihan (1-5):" "$BLUE"
+    info "Pilihan (1-4):" "$BLUE"
     read -r cleanup_choice
     
     case $cleanup_choice in
         1) cleanup_specific_server ;;
         2) cleanup_all_servers ;;
         3) cleanup_orphaned_users ;;
-        4) cleanup_ssh_jail ;;
-        5) show_main_menu ;;
+        4) show_main_menu ;;
         *) error "Pilihan tidak valid!"; sleep 2; cleanup_all ;;
     esac
 }
@@ -829,29 +794,16 @@ cleanup_specific_server() {
     # Remove from fstab
     sed -i "\|/home/minecraft/$selected_server|d" /etc/fstab
     
-    # Find and remove related Minecraft users
+    # Find and remove related users
     for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
         if [ -d "/home/minecraft/$selected_server" ] && [ "$(stat -c '%U' "/home/minecraft/$selected_server" 2>/dev/null)" == "$user" ]; then
-            userdel -r "$user" 2>/dev/null
-            success "Removed Minecraft user $user"
-        fi
-    done
-    
-    # Remove SFTP users and chroot
-    for user in $(getent passwd | grep -E ".*-sftp" | cut -d: -f1); do
-        if [ -d "$CHROOT_BASE/$user" ]; then
-            # Unmount
-            umount "$CHROOT_BASE/$user/minecraft/$selected_server" 2>/dev/null
-            # Remove from fstab
-            sed -i "\|$CHROOT_BASE/$user|d" /etc/fstab
-            # Remove chroot
-            rm -rf "$CHROOT_BASE/$user"
+            # Unmount bind mounts
+            umount "/home/$user/minecraft/$selected_server" 2>/dev/null
+            sed -i "\|/home/$user/minecraft/$selected_server|d" /etc/fstab
+            
             # Remove user
             userdel -r "$user" 2>/dev/null
-            success "Removed SFTP user $user"
-            
-            # Remove SSH config for this user
-            sed -i "/Match User $user/,/PasswordAuthentication yes/d" /etc/ssh/sshd_config
+            success "Removed user $user"
         fi
     done
     
@@ -859,7 +811,6 @@ cleanup_specific_server() {
     rm -rf "/home/minecraft/$selected_server"
     
     systemctl daemon-reload
-    systemctl restart sshd
     
     success "Server $selected_server cleaned up!"
     sleep 2
@@ -890,27 +841,22 @@ cleanup_all_servers() {
         fi
     done
     
-    # Remove all users (mcserver* and *-sftp)
-    for user in $(getent passwd | grep -E "(mcserver[0-9]+|.*-sftp)" | cut -d: -f1); do
+    # Remove all users (mcserver*)
+    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
+        # Unmount all bind mounts
+        umount "/home/$user/minecraft/"* 2>/dev/null
         userdel -r "$user" 2>/dev/null
         success "Removed user $user"
     done
-    
-    # Remove all chroot jails
-    rm -rf "$CHROOT_BASE"/*
     
     # Remove all server folders
     rm -rf /home/minecraft/*
     
     # Clean fstab
     sed -i "\|/home/minecraft|d" /etc/fstab
-    sed -i "\|$CHROOT_BASE|d" /etc/fstab
-    
-    # Clean SSH config
-    sed -i '/# Chroot jail for/,/PasswordAuthentication yes/d' /etc/ssh/sshd_config
+    sed -i "\|/home/mcserver|d" /etc/fstab
     
     systemctl daemon-reload
-    systemctl restart sshd
     
     success "All servers and users have been removed!"
     sleep 2
@@ -922,7 +868,7 @@ cleanup_orphaned_users() {
     info "Looking for orphaned users..."
     
     local found=0
-    for user in $(getent passwd | grep -E "(mcserver[0-9]+|.*-sftp)" | cut -d: -f1); do
+    for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
         local has_server=0
         
         # Check if user owns any server folder
@@ -933,17 +879,15 @@ cleanup_orphaned_users() {
             fi
         done
         
-        # Check if user has chroot with mounted server
-        if [ -d "$CHROOT_BASE/$user" ]; then
-            if mount | grep -q "$CHROOT_BASE/$user"; then
-                has_server=1
-            fi
-        fi
-        
         if [ $has_server -eq 0 ]; then
             warning "Found orphaned user: $user"
+            
+            # Unmount any mounts
+            umount "/home/$user/minecraft/"* 2>/dev/null
+            sed -i "\|/home/$user|d" /etc/fstab
+            
+            # Remove user
             userdel -r "$user" 2>/dev/null
-            rm -rf "$CHROOT_BASE/$user"
             success "Removed orphaned user $user"
             found=1
         fi
@@ -952,28 +896,6 @@ cleanup_orphaned_users() {
     if [ $found -eq 0 ]; then
         success "No orphaned users found"
     fi
-    
-    sleep 2
-    cleanup_all
-}
-
-# Fungsi untuk cleanup SSH jail config
-cleanup_ssh_jail() {
-    info "Cleaning SSH jail configurations..."
-    
-    # Remove all chroot configs
-    sed -i '/# Chroot jail for/,/PasswordAuthentication yes/d' /etc/ssh/sshd_config
-    
-    # Remove sftp-users group if empty
-    if getent group sftp-users >/dev/null; then
-        if [ -z "$(getent group sftp-users | cut -d: -f4)" ]; then
-            groupdel sftp-users
-            success "Removed empty sftp-users group"
-        fi
-    fi
-    
-    systemctl restart sshd
-    success "SSH jail configurations cleaned"
     
     sleep 2
     cleanup_all
@@ -1000,76 +922,32 @@ list_all_servers() {
             if [ -f "$dir/bedrock_server" ]; then
                 if systemctl is-active --quiet "$server_name.service" 2>/dev/null; then
                     status="${GREEN}● RUNNING${NC}"
+                    
+                    # Get PID
+                    pid=$(pgrep -f "bedrock_server.*$server_name" | head -1)
+                    [ -n "$pid" ] && pid_info=" (PID: $pid)" || pid_info=""
                 else
                     status="${RED}○ STOPPED${NC}"
+                    pid_info=""
                 fi
             else
                 status="${YELLOW}○ INCOMPLETE${NC}"
+                pid_info=""
             fi
             
             port=$(grep "^server-port=" "$dir/server.properties" 2>/dev/null | cut -d'=' -f2)
             owner=$(stat -c '%U' "$dir" 2>/dev/null)
             
-            # Find SFTP users accessing this server
-            sftp_users=""
-            for user in $(getent passwd | grep -E ".*-sftp" | cut -d: -f1); do
-                if [ -d "$CHROOT_BASE/$user/minecraft/$server_name" ]; then
-                    sftp_users+="$user, "
-                fi
-            done
-            sftp_users=${sftp_users%, }
-            [ -z "$sftp_users" ] && sftp_users="none"
-            
             echo -e "\n${PURPLE}📁 $server_name${NC}"
-            echo -e "  Status  : $status"
+            echo -e "  Status  : $status$pid_info"
             echo -e "  Port    : ${port:-N/A}"
             echo -e "  Owner   : $owner"
-            echo -e "  SFTP    : $sftp_users"
             echo -e "  Path    : $dir"
         fi
     done
     
     if [ $found -eq 0 ]; then
         error "No Minecraft servers found"
-    fi
-    
-    echo
-    info "Press Enter to continue..." "$BLUE"
-    read -r
-    show_main_menu
-}
-
-# Fungsi untuk list SFTP users
-list_sftp_users() {
-    clear_screen
-    echo -e "\n${CYAN}══════════════════════════════════════════════════════════${NC}"
-    info "SFTP USERS (Chroot Jail)" "$PURPLE"
-    echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
-    
-    local found=0
-    while IFS=: read -r username _ uid gid desc home shell; do
-        if [[ "$username" == *-sftp ]] || [ -d "$CHROOT_BASE/$username" ]; then
-            found=1
-            
-            # Get chroot info
-            if [ -d "$CHROOT_BASE/$username" ]; then
-                chroot_path="$CHROOT_BASE/$username"
-                # Find which server they can access
-                server_access=$(ls "$chroot_path/minecraft/" 2>/dev/null | head -1)
-                [ -z "$server_access" ] && server_access="none"
-                
-                echo -e "\n${PURPLE}👤 $username${NC}"
-                echo -e "  UID      : $uid"
-                echo -e "  Server   : $server_access"
-                echo -e "  Chroot   : $chroot_path"
-                echo -e "  Jail Root: / (cannot go up)"
-                echo -e "  Access   : /minecraft/$server_access/"
-            fi
-        fi
-    done < /etc/passwd
-    
-    if [ $found -eq 0 ]; then
-        error "No SFTP users found"
     fi
     
     echo
@@ -1087,20 +965,18 @@ show_main_menu() {
     echo "  1) Install new Minecraft server(s)"
     echo "  2) Uninstall existing server"
     echo "  3) List all servers"
-    echo "  4) Show SFTP users"
-    echo "  5) Cleanup menu"
-    echo "  6) Exit"
+    echo "  4) Cleanup menu"
+    echo "  5) Exit"
     echo -e "${CYAN}══════════════════════════════════════════════════════════${NC}"
-    info "Pilihan (1-6):" "$BLUE"
+    info "Pilihan (1-5):" "$BLUE"
     read -r menu_choice
     
     case $menu_choice in
         1) install_new_servers ;;
         2) uninstall_server ;;
         3) list_all_servers ;;
-        4) list_sftp_users ;;
-        5) cleanup_all ;;
-        6) exit 0 ;;
+        4) cleanup_all ;;
+        5) exit 0 ;;
         *) error "Pilihan tidak valid!"; sleep 2; show_main_menu ;;
     esac
 }
@@ -1115,7 +991,7 @@ install_new_servers() {
     
     # Initialize arrays
     declare -a server_configs=()
-    declare -a sftp_users=()
+    declare -a server_users=()
     
     setup_user_and_folders
     
@@ -1150,24 +1026,25 @@ install_new_servers() {
         enable_service "$config"
     done
     
-    # Restart SSH to apply chroot changes
-    systemctl restart sshd
-    
     # Display credentials
     echo -e "\n${GREEN}══════════════════════════════════════════════════════════${NC}"
-    info "SFTP ACCESS CREDENTIALS" "$PURPLE"
+    info "SERVER ACCESS CREDENTIALS" "$PURPLE"
     echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
     
     local ip_address=$(hostname -I | awk '{print $1}')
-    for user_info in "${sftp_users[@]}"; do
+    for user_info in "${server_users[@]}"; do
         IFS='|' read -r username password server_folder <<< "$user_info"
         
         echo -e "\n${CYAN}Server: $server_folder${NC}"
-        echo -e "  Username : $username"
-        echo -e "  Password : ${YELLOW}$password${NC}"
-        echo -e "  Command  : sftp $username@$ip_address"
-        echo -e "  Jail Root: / (cannot go up)"
-        echo -e "  Access   : /minecraft/$server_folder/"
+        echo -e "  Username     : $username"
+        echo -e "  Password     : ${YELLOW}$password${NC}"
+        echo -e "  SSH Command  : ssh $username@$ip_address -p $SSH_PORT"
+        echo -e "  SFTP URL     : sftp://$username@$ip_address:$SSH_PORT"
+        echo -e "  Restrictions : - Restricted shell (rbash)"
+        echo -e "                 - Cannot use sudo"
+        echo -e "                 - Cannot run system commands"
+        echo -e "                 - Only cd, ls, exit in home"
+        echo -e "  Server Path  : ~/server/ -> /home/minecraft/$server_folder/"
     done
     
     echo -e "\n${RED}⚠ IMPORTANT: Save these passwords! They won't be shown again.${NC}"
