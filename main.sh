@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Auto Installer v5.6 - Enterprise Edition
-# Fixed SFTP error + Simplified directory structure
+# Minecraft Bedrock Server Auto Installer v5.7 - Enterprise Edition
+# Fixed SSH detection + Simple tmux service + Security hardening
 
 # Warna untuk output
 RED='\033[0;31m'
@@ -14,11 +14,12 @@ WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Konfigurasi global
-SCRIPT_VERSION="5.6"
+SCRIPT_VERSION="5.7"
 MIN_DISK_SPACE=1024  # MB
 MIN_RAM_PER_SERVER=512  # MB
 SSH_PORT=22
 BASE_PATH="/home/minecraft"
+JAIL_BASE="/var/chroot"
 
 # Language variables
 LANG_EN=0
@@ -31,7 +32,7 @@ clear_screen() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║    Minecraft Bedrock Server Auto Installer v$SCRIPT_VERSION        ║"
-    echo "║         (Enterprise Edition - Fixed SFTP)               ║"
+    echo "║         (Enterprise Edition - Security Hardened)        ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -158,7 +159,6 @@ check_dependencies() {
     if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
         info "$(t "Generating SSH host keys..." "Membuat SSH host keys...")"
         dpkg-reconfigure openssh-server
-        systemctl restart sshd
     fi
     
     configure_ssh
@@ -182,13 +182,31 @@ configure_ssh() {
     sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
     sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$sshd_config"
     
-    # Enable SFTP internal
-    if ! grep -q "Subsystem sftp internal-sftp" "$sshd_config"; then
+    # Enable SFTP internal subsystem
+    if ! grep -q "^Subsystem sftp" "$sshd_config"; then
         echo "Subsystem sftp internal-sftp" >> "$sshd_config"
+    else
+        sed -i 's/^Subsystem sftp.*/Subsystem sftp internal-sftp/' "$sshd_config"
     fi
     
-    systemctl restart sshd
-    success "$(t "SSH configured" "SSH dikonfigurasi")"
+    # Restart SSH service (handles both ssh and sshd)
+    restart_ssh_service
+}
+
+# Fungsi untuk restart SSH service
+restart_ssh_service() {
+    info "$(t "Restarting SSH service..." "Merestart service SSH...")"
+    
+    if systemctl list-units --full -all | grep -q "sshd.service"; then
+        systemctl restart sshd
+        success "sshd.service restarted"
+    elif systemctl list-units --full -all | grep -q "ssh.service"; then
+        systemctl restart ssh
+        success "ssh.service restarted"
+    else
+        warning "$(t "SSH service not found, trying to start..." "Service SSH tidak ditemukan, mencoba memulai...")"
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    fi
 }
 
 # Fungsi untuk generate random password
@@ -206,10 +224,13 @@ setup_minecraft_user() {
     
     # Create user if not exists
     if ! id "$username" &>/dev/null; then
-        useradd -m -d "/home/$username" -s /bin/bash "$username"
-        success "$(t "User" "User") $username $(t "created" "dibuat")"
+        # SECURITY: Set shell to nologin for service user (no SSH login)
+        useradd -m -d "/home/$username" -s /usr/sbin/nologin "$username"
+        success "$(t "User" "User") $username $(t "created with nologin shell" "dibuat dengan shell nologin")"
     else
         warning "$(t "User" "User") $username $(t "already exists" "sudah ada")"
+        # Set shell to nologin for security
+        usermod -s /usr/sbin/nologin "$username"
         pkill -u "$username" 2>/dev/null
     fi
     
@@ -217,68 +238,29 @@ setup_minecraft_user() {
     echo "$username:$password" | chpasswd
     success "$(t "Password set for" "Password diatur untuk") $username"
     
-    # Remove any existing bind mounts
-    umount "/home/$username/minecraft" 2>/dev/null
-    sed -i "\|/home/$username/minecraft|d" /etc/fstab
-    
-    # Create minecraft directory in user home
-    mkdir -p "/home/$username/minecraft"
-    
-    # Bind mount the server folder to user's minecraft directory
-    if ! grep -q "/home/$username/minecraft" /etc/fstab; then
-        echo "$server_path /home/$username/minecraft none bind 0 0" >> /etc/fstab
-    fi
-    
-    # Mount it
-    mount --bind "$server_path" "/home/$username/minecraft" 2>/dev/null
-    
-    # Create symlink directly in home
-    ln -sf "/home/$username/minecraft" "/home/$username/server"
-    
-    # Set proper ownership
-    chown -R "$username:$username" "/home/$username"
-    chmod 755 "/home/$username"
-    
-    # FIXED: .bashrc dengan conditional untuk interactive shell saja
-    cat > "/home/$username/.bashrc" << 'EOF'
-# Only run for interactive shell (SSH), not for SFTP
-if [[ $- == *i* ]]; then
-    if [ -d "$HOME/minecraft" ]; then
-        cd "$HOME/minecraft"
-        echo "Welcome to Minecraft Server - $(basename $(pwd))"
-        echo "You are in your server directory. Files available:"
-        ls -F --color=auto
-    fi
-fi
-
-# Simple prompt
-PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\W\[\e[0m\]\$ '
-
-# Aliases
-alias ll='ls -la'
-alias la='ls -a'
-alias l='ls -CF'
-
-# No dangerous commands
-alias sudo='echo "sudo not allowed"'
-alias apt='echo "apt not allowed"'
-alias systemctl='echo "systemctl not allowed"'
-alias service='echo "service not allowed"'
-alias dpkg='echo "dpkg not allowed"'
-EOF
-    
-    # Set proper permissions for .bashrc
-    chown "$username:$username" "/home/$username/.bashrc"
-    
-    # Ensure SSH directory exists for future key-based auth
+    # Create SFTP jail directory structure
     mkdir -p "/home/$username/.ssh"
     chmod 700 "/home/$username/.ssh"
     chown "$username:$username" "/home/$username/.ssh"
     
-    # Add user to appropriate groups
-    usermod -aG "$username" "$username"
+    # Create the server directory
+    mkdir -p "$server_path"
     
-    success "$(t "User" "User") $username $(t "setup complete" "setup selesai")"
+    # Set proper ownership
+    chown -R "$username:$username" "$server_path"
+    chmod 755 "$server_path"
+    chown "$username:$username" "/home/$username"
+    chmod 755 "/home/$username"
+    
+    # Create .bashrc for SFTP/SCP (won't be used for shell since shell is nologin)
+    # This is for compatibility
+    cat > "/home/$username/.bashrc" << 'EOF'
+# This file is for SFTP compatibility only
+# Shell access is disabled for this user
+EOF
+    chown "$username:$username" "/home/$username/.bashrc"
+    
+    success "$(t "User" "User") $username $(t "setup complete (nologin - SFTP only)" "setup selesai (nologin - hanya SFTP)")"
 }
 
 # Fungsi untuk setup user dengan pilihan password
@@ -291,6 +273,7 @@ setup_user_with_password() {
     echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     info "$(t "Username:" "Username:") $username"
+    info "$(t "This user will have SFTP only access (no shell)" "User ini hanya memiliki akses SFTP (tanpa shell)")"
     
     info "$(t "Choose password method:" "Pilih metode password:")" "$BLUE"
     echo "  1) $(t "Generate random password (recommended)" "Generate random password (disarankan)")"
@@ -377,7 +360,7 @@ check_port() {
     return 0
 }
 
-# Fungsi untuk sanitasi nama folder (not used much now since we use username directly)
+# Fungsi untuk sanitasi nama folder
 sanitize_folder_name() {
     local name=$1
     echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-'
@@ -639,7 +622,7 @@ EOF
     return 0
 }
 
-# Fungsi untuk membuat systemd service
+# Fungsi untuk membuat systemd service - CHANGED to Type=simple
 create_systemd() {
     local config=$1
     IFS='|' read -r username server_name level_name level_seed server_port server_portv6 gamemode difficulty allow_cheats <<< "$config"
@@ -665,6 +648,7 @@ create_systemd() {
     local ram_per_server=$((total_ram / jumlah_server))
     [ $ram_per_server -gt 2048 ] && ram_per_server=2048
     
+    # FIXED: Type=simple for tmux + Kill existing session before starting
     cat > "$service_file" << EOF
 [Unit]
 Description=Minecraft Bedrock Server - $server_name
@@ -673,12 +657,13 @@ StartLimitInterval=60
 StartLimitBurst=3
 
 [Service]
-Type=forking
+Type=simple
 User=$username
 Group=$username
 Environment=HOME=$server_path
 Environment=USER=$username
 WorkingDirectory=$server_path
+ExecStartPre=/usr/bin/tmux kill-session -t $username 2>/dev/null
 ExecStart=/usr/bin/tmux new-session -d -s $username -c $server_path '$server_path/bedrock_server'
 ExecStop=/usr/bin/tmux kill-session -t $username
 ExecReload=/usr/bin/tmux send-keys -t $username 'reload' C-m
@@ -734,6 +719,12 @@ start_all_servers() {
         if systemctl is-active --quiet "$username.service"; then
             success "$username $(t "running" "berjalan")"
             
+            # FIXED: PID detection using pgrep with username
+            local pid=$(pgrep -u "$username" -f "bedrock_server" | head -1)
+            if [ -n "$pid" ]; then
+                success "PID: $pid"
+            fi
+            
             # Check tmux session
             if tmux has-session -t "$username" 2>/dev/null; then
                 success "Tmux session: $username"
@@ -763,7 +754,6 @@ cleanup_total() {
     error "  • $(t "All Minecraft servers" "Semua Minecraft servers")"
     error "  • $(t "All users (mcserver*)" "Semua user (mcserver*)")"
     error "  • $(t "All systemd services" "Semua systemd services")"
-    error "  • $(t "All bind mounts" "Semua bind mounts")"
     error "  • $(t "All SSH configurations" "Semua konfigurasi SSH")"
     echo
     warning "$(t "Type 'TOTAL-DELETE' to confirm:" "Ketik 'TOTAL-DELETE' untuk konfirmasi:")"
@@ -795,15 +785,6 @@ cleanup_total() {
         tmux kill-session -t "$user" 2>/dev/null
     done
     
-    # Remove all bind mounts from fstab
-    info "$(t "Cleaning fstab..." "Membersihkan fstab...")"
-    sed -i "\|$BASE_PATH|d" /etc/fstab
-    sed -i "\|/home/mcserver|d" /etc/fstab
-    
-    # Unmount all bind mounts
-    info "$(t "Unmounting all bind mounts..." "Unmount semua bind mounts...")"
-    mount | grep "/home/mcserver" | awk '{print $3}' | xargs -r umount -f 2>/dev/null
-    
     # Remove all Minecraft users
     info "$(t "Removing all Minecraft users..." "Menghapus semua Minecraft users...")"
     for user in $(getent passwd | grep -E "^mcserver[0-9]+" | cut -d: -f1); do
@@ -826,7 +807,7 @@ cleanup_total() {
     sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
     
     systemctl daemon-reload
-    systemctl restart sshd
+    restart_ssh_service
     
     success "✅ $(t "Total cleanup complete! Everything has been removed." "Total cleanup selesai! Semua telah dihapus.")"
     info "$(t "System returned to pre-installation state." "Sistem kembali ke keadaan sebelum instalasi.")"
@@ -911,15 +892,8 @@ cleanup_specific_server() {
     systemctl disable "$selected_user.service" 2>/dev/null
     rm -f "/etc/systemd/system/$selected_user.service"
     
-    # Remove from fstab
-    sed -i "\|$BASE_PATH/$selected_user|d" /etc/fstab
-    
     # Kill tmux session
     tmux kill-session -t "$selected_user" 2>/dev/null
-    
-    # Unmount bind mounts
-    umount "/home/$selected_user/minecraft" 2>/dev/null
-    sed -i "\|/home/$selected_user/minecraft|d" /etc/fstab
     
     # Kill user processes
     pkill -u "$selected_user" 2>/dev/null
@@ -948,8 +922,6 @@ cleanup_orphaned_users() {
             warning "$(t "Found orphaned user:" "Ditemukan user yatim:") $user"
             
             tmux kill-session -t "$user" 2>/dev/null
-            umount "/home/$user/minecraft" 2>/dev/null
-            sed -i "\|/home/$user|d" /etc/fstab
             pkill -u "$user" 2>/dev/null
             userdel -r "$user" 2>/dev/null
             success "$(t "Removed orphaned user" "User yatim dihapus") $user"
@@ -982,7 +954,8 @@ list_all_servers() {
                 if [ -f "$dir/bedrock_server" ]; then
                     if systemctl is-active --quiet "$username.service" 2>/dev/null; then
                         status="${GREEN}● $(t "RUNNING" "BERJALAN")${NC}"
-                        pid=$(pgrep -f "bedrock_server" | head -1)
+                        # FIXED: PID detection using pgrep with username
+                        local pid=$(pgrep -u "$username" -f "bedrock_server" | head -1)
                         [ -n "$pid" ] && pid_info=" (PID: $pid)" || pid_info=""
                     else
                         status="${RED}○ $(t "STOPPED" "BERHENTI")${NC}"
@@ -995,6 +968,14 @@ list_all_servers() {
                 
                 port=$(grep "^server-port=" "$dir/server.properties" 2>/dev/null | cut -d'=' -f2)
                 
+                # Get shell info
+                local user_shell=$(getent passwd "$username" | cut -d: -f7)
+                if [[ "$user_shell" == *"nologin" ]]; then
+                    shell_info="(SFTP only)"
+                else
+                    shell_info="(shell: $user_shell)"
+                fi
+                
                 # Check tmux session
                 if tmux has-session -t "$username" 2>/dev/null; then
                     tmux_info=" (tmux)"
@@ -1005,7 +986,7 @@ list_all_servers() {
                 echo -e "\n${PURPLE}📁 $username${NC}"
                 echo -e "  $(t "Status" "Status")  : $status$pid_info"
                 echo -e "  $(t "Port" "Port")    : ${port:-N/A}"
-                echo -e "  $(t "User" "User")    : $username$tmux_info"
+                echo -e "  $(t "User" "User")    : $username$tmux_info $shell_info"
                 echo -e "  $(t "Path" "Path")    : $dir"
             fi
         fi
@@ -1097,6 +1078,9 @@ install_new_servers() {
         enable_service "$config"
     done
     
+    # Restart SSH to apply any changes
+    restart_ssh_service
+    
     # Display credentials
     echo -e "\n${GREEN}══════════════════════════════════════════════════════════${NC}"
     info "$(t "SERVER ACCESS CREDENTIALS" "KREDENSIAL AKSES SERVER")" "$PURPLE"
@@ -1109,9 +1093,9 @@ install_new_servers() {
         echo -e "\n${CYAN}$(t "Server:" "Server:") $username${NC}"
         echo -e "  $(t "Username" "Username")     : $username"
         echo -e "  $(t "Password" "Password")     : ${YELLOW}$password${NC}"
-        echo -e "  SSH $(t "Command" "Perintah")  : ssh $username@$ip_address -p $SSH_PORT"
         echo -e "  SFTP URL     : sftp://$username@$ip_address:$SSH_PORT"
-        echo -e "  $(t "Server Path" "Path Server")  : /home/$username/minecraft/ ($(t "auto-cd on login" "auto-cd saat login"))"
+        echo -e "  $(t "Server Path" "Path Server")  : $BASE_PATH/$username/"
+        echo -e "  $(t "Access Type" "Tipe Akses") : SFTP only (no shell)"
     done
     
     echo -e "\n${RED}⚠ $(t "IMPORTANT: Save these passwords! They won't be shown again." "PENTING: Simpan password ini! Tidak akan ditampilkan lagi.")${NC}"
