@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Minecraft Bedrock Server Manager v1.0 Clean Edition
+# Minecraft Bedrock Server Manager v1.0 Clean Edition - FIXED
 # A complete CLI-based server management solution
+# Fixed: Systemd issues, real-time monitor exit, server startup problems
 
 # ============================================
 # CONFIGURATION AND COLORS
@@ -12,13 +13,21 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
 WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
 # Base directories
 BASE_DIR="/home/minecraft"
 SCRIPT_NAME=$(basename "$0")
-VERSION="v1.0 Clean Edition"
+VERSION="v1.0 Clean Edition (Fixed)"
+
+# Check if running in container/without systemd
+USING_SYSTEMD=false
+if pidof systemd >/dev/null 2>&1 && [ "$(ps -p1 -o comm= 2>/dev/null)" = "systemd" ]; then
+    USING_SYSTEMD=true
+fi
 
 # ============================================
 # UTILITY FUNCTIONS
@@ -48,6 +57,10 @@ print_info() {
     echo -e "${CYAN}[INFO]${NC} $1"
 }
 
+print_doing() {
+    echo -e "${BLUE}[DOING]${NC} $1"
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
@@ -55,22 +68,30 @@ check_root() {
     fi
 }
 
+# Trap Ctrl+C for clean exit
+trap_ctrl_c() {
+    echo ""
+    print_warning "Interrupted by user"
+    sleep 1
+    return 2
+}
+
 # ============================================
 # DEPENDENCY INSTALLATION
 # ============================================
 
 install_dependencies() {
-    print_info "Checking and installing dependencies..."
+    print_doing "Checking and installing dependencies..."
     
     # Update package list
-    apt-get update -qq
+    apt-get update -qq > /dev/null 2>&1
     
     # Install required packages
-    DEPS=("unzip" "curl" "wget" "tmux" "openssh-server")
+    DEPS=("unzip" "curl" "wget" "tmux" "openssh-server" "procps" "htop")
     
     for dep in "${DEPS[@]}"; do
         if ! command -v "$dep" &> /dev/null; then
-            print_info "Installing $dep..."
+            print_doing "Installing $dep..."
             apt-get install -y "$dep" > /dev/null 2>&1
             print_success "$dep installed"
         else
@@ -100,6 +121,8 @@ generate_server_properties() {
     local level_name="$6"
     local level_seed="$7"
     local server_dir="$8"
+    
+    print_doing "Generating server.properties..."
     
     cat > "$server_dir/server.properties" << EOF
 # Minecraft Bedrock Server Properties
@@ -159,11 +182,11 @@ EOF
     # Explanation of key settings
     echo ""
     print_info "Server Properties Explanation:"
-    echo "  - server-portv6 = port+1 (IPv6 uses next port)"
-    echo "  - max-players=99999 (Removes player limit for large communities)"
-    echo "  - view-distance=10 (Balances performance vs visibility)"
-    echo "  - tick-distance=4 (Optimizes chunk loading)"
-    echo "  - max-threads=8 (Optimized for multi-core CPUs)"
+    echo "  ${YELLOW}• server-portv6 = port+1${NC} (IPv6 uses next port)"
+    echo "  ${YELLOW}• max-players=99999${NC} (Removes player limit for large communities)"
+    echo "  ${YELLOW}• view-distance=10${NC} (Balances performance vs visibility)"
+    echo "  ${YELLOW}• tick-distance=4${NC} (Optimizes chunk loading)"
+    echo "  ${YELLOW}• max-threads=8${NC} (Optimized for multi-core CPUs)"
 }
 
 # ============================================
@@ -197,13 +220,16 @@ get_available_slots() {
 # ============================================
 
 get_latest_version() {
+    print_doing "Fetching latest Minecraft Bedrock version..."
     local version_url="https://www.minecraft.net/en-us/download/server/bedrock"
-    local download_page=$(curl -s "$version_url")
+    local download_page=$(curl -s "$version_url" 2>/dev/null)
     local version=$(echo "$download_page" | grep -oP 'bedrock-server-\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     
     if [[ -z "$version" ]]; then
         echo "1.20.80.05" # Fallback version
+        print_warning "Could not fetch latest version, using fallback: 1.20.80.05"
     else
+        print_success "Latest version: $version"
         echo "$version"
     fi
 }
@@ -217,7 +243,35 @@ generate_password() {
 }
 
 # ============================================
-# CREATE SYSTEMD SERVICE
+# CREATE SERVER LAUNCHER SCRIPT
+# ============================================
+
+create_launcher_script() {
+    local server_num="$1"
+    local server_dir="$BASE_DIR/mcserver$server_num"
+    
+    print_doing "Creating server launcher script..."
+    
+    cat > "$server_dir/start.sh" << 'EOF'
+#!/bin/bash
+# Server launcher script with auto-restart
+cd "$(dirname "$0")"
+while true; do
+    echo "[$(date)] Starting bedrock server..."
+    ./bedrock_server
+    echo "[$(date)] Server stopped. Restarting in 5 seconds..."
+    sleep 5
+done
+EOF
+
+    chmod +x "$server_dir/start.sh"
+    chown "mcserver$server_num:mcserver$server_num" "$server_dir/start.sh"
+    
+    print_success "Launcher script created"
+}
+
+# ============================================
+# CREATE SYSTEMD SERVICE (if available)
 # ============================================
 
 create_systemd_service() {
@@ -225,7 +279,10 @@ create_systemd_service() {
     local server_user="mcserver$server_num"
     local server_dir="$BASE_DIR/mcserver$server_num"
     
-    cat > "/etc/systemd/system/mcserver$server_num.service" << EOF
+    if [[ "$USING_SYSTEMD" == true ]]; then
+        print_doing "Creating systemd service for mcserver$server_num..."
+        
+        cat > "/etc/systemd/system/mcserver$server_num.service" << EOF
 [Unit]
 Description=Minecraft Bedrock Server $server_num
 After=network.target
@@ -235,8 +292,9 @@ Type=forking
 User=$server_user
 Group=$server_user
 WorkingDirectory=$server_dir
-ExecStart=/usr/bin/tmux new-session -d -s mcserver$server_num -c $server_dir './bedrock_server'
-ExecStop=/usr/bin/tmux send-keys -t mcserver$server_num "stop" C-m
+ExecStart=/usr/bin/tmux new-session -d -s mcserver$server_num -c $server_dir './start.sh'
+ExecStop=/usr/bin/tmux send-keys -t mcserver$server_num C-c C-m
+ExecStop=/usr/bin/tmux kill-session -t mcserver$server_num
 ExecReload=/usr/bin/tmux send-keys -t mcserver$server_num "reload" C-m
 Restart=on-failure
 RestartSec=10
@@ -245,8 +303,59 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    print_success "Systemd service created for mcserver$server_num"
+        systemctl daemon-reload
+        print_success "Systemd service created"
+    else
+        print_warning "Systemd not available - creating startup script only"
+        
+        # Create init script for non-systemd systems
+        cat > "/etc/init.d/mcserver$server_num" << EOF
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          mcserver$server_num
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Minecraft Bedrock Server $server_num
+# Description:       Minecraft Bedrock Server $server_num
+### END INIT INFO
+
+case "\$1" in
+    start)
+        echo "Starting Minecraft Server $server_num..."
+        su - $server_user -c "cd $server_dir && tmux new-session -d -s mcserver$server_num './start.sh'"
+        ;;
+    stop)
+        echo "Stopping Minecraft Server $server_num..."
+        su - $server_user -c "tmux send-keys -t mcserver$server_num C-c C-m"
+        sleep 5
+        su - $server_user -c "tmux kill-session -t mcserver$server_num" 2>/dev/null
+        ;;
+    restart)
+        \$0 stop
+        sleep 2
+        \$0 start
+        ;;
+    status)
+        if su - $server_user -c "tmux has-session -t mcserver$server_num" 2>/dev/null; then
+            echo "Server mcserver$server_num is running"
+            exit 0
+        else
+            echo "Server mcserver$server_num is stopped"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Usage: \$0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit 0
+EOF
+        chmod +x "/etc/init.d/mcserver$server_num"
+        print_success "Init script created at /etc/init.d/mcserver$server_num"
+    fi
 }
 
 # ============================================
@@ -262,6 +371,7 @@ install_server() {
     local slot=$(get_available_slots)
     if [[ "$slot" -eq "0" ]]; then
         print_error "No available server slots (max 10 servers)"
+        read -p "Press Enter to continue..."
         return 1
     fi
     
@@ -284,6 +394,7 @@ install_server() {
     
     if [[ "$num_servers" -gt "$available_slots" ]]; then
         print_error "Only $available_slots slots available. Requested: $num_servers"
+        read -p "Press Enter to continue..."
         return 1
     fi
     
@@ -336,68 +447,100 @@ install_server() {
             read -p "Level seed (leave empty for random): " level_seed
             
             echo ""
-            print_info "Creating server user and directory..."
+            print_doing "Creating server user and directory..."
             
             # Create user
             local password=$(generate_password)
-            useradd -m -d "$BASE_DIR/mcserver$i" -s /bin/bash -U "mcserver$i"
-            echo "mcserver$i:$password" | chpasswd
+            useradd -m -d "$BASE_DIR/mcserver$i" -s /bin/bash -U "mcserver$i" 2>/dev/null
+            
+            if [[ $? -ne 0 ]]; then
+                print_error "Failed to create user. Trying to continue..."
+            fi
+            
+            echo "mcserver$i:$password" | chpasswd 2>/dev/null
             
             # Set permissions
-            chown -R "mcserver$i:mcserver$i" "$BASE_DIR/mcserver$i"
+            chown -R "mcserver$i:mcserver$i" "$BASE_DIR/mcserver$i" 2>/dev/null
             chmod 755 "$BASE_DIR/mcserver$i"
             
             # Download server files
-            print_info "Downloading Minecraft Bedrock Server v$version..."
+            print_doing "Downloading Minecraft Bedrock Server v$version..."
             local download_url="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-$version.zip"
             
-            if ! wget -q "$download_url" -O "/tmp/bedrock-server-$version.zip"; then
+            if ! wget -q --show-progress "$download_url" -O "/tmp/bedrock-server-$version.zip"; then
                 print_error "Failed to download server files"
-                userdel -r "mcserver$i"
+                userdel -r "mcserver$i" 2>/dev/null
+                read -p "Press Enter to continue..."
                 return 1
             fi
             
             # Extract files
-            print_info "Extracting server files..."
+            print_doing "Extracting server files..."
             unzip -q "/tmp/bedrock-server-$version.zip" -d "$BASE_DIR/mcserver$i/"
             
             # Generate server.properties
             generate_server_properties "$server_name" "$gamemode" "$difficulty" "$allow_cheats" "$server_port" "$level_name" "$level_seed" "$BASE_DIR/mcserver$i"
             
+            # Create launcher script
+            create_launcher_script "$i"
+            
             # Set proper ownership
             chown -R "mcserver$i:mcserver$i" "$BASE_DIR/mcserver$i"
             chmod +x "$BASE_DIR/mcserver$i/bedrock_server"
+            chmod +x "$BASE_DIR/mcserver$i/start.sh"
             
-            # Create systemd service
+            # Create service (systemd or init.d)
             create_systemd_service "$i"
             
             # Start server
-            systemctl start "mcserver$i"
-            systemctl enable "mcserver$i" > /dev/null 2>&1
+            print_doing "Starting server mcserver$i..."
+            
+            if [[ "$USING_SYSTEMD" == true ]]; then
+                systemctl start "mcserver$i" 2>/dev/null
+                systemctl enable "mcserver$i" > /dev/null 2>&1
+            else
+                /etc/init.d/mcserver$i start
+                update-rc.d mcserver$i defaults 2>/dev/null
+            fi
             
             # Cleanup
             rm -f "/tmp/bedrock-server-$version.zip"
+            
+            # Verify server is running
+            sleep 3
+            if tmux has-session -t "mcserver$i" 2>/dev/null; then
+                print_success "Server is running!"
+            else
+                print_warning "Server may not be running. Check manually with: tmux attach -t mcserver$i"
+            fi
             
             # Display server info
             echo ""
             print_success "Server mcserver$i installed successfully!"
             echo ""
             echo -e "${WHITE}Server Information:${NC}"
-            echo "  Username: mcserver$i"
-            echo "  Password: $password"
-            echo "  Server Path: $BASE_DIR/mcserver$i"
-            echo "  Port: $server_port"
+            echo "  ${GREEN}Username:${NC} mcserver$i"
+            echo "  ${GREEN}Password:${NC} $password"
+            echo "  ${GREEN}Server Path:${NC} $BASE_DIR/mcserver$i"
+            echo "  ${GREEN}Port:${NC} $server_port"
             echo ""
             echo -e "${WHITE}Control Commands:${NC}"
-            echo "  Start:   systemctl start mcserver$i"
-            echo "  Stop:    systemctl stop mcserver$i"
-            echo "  Restart: systemctl restart mcserver$i"
-            echo "  Status:  systemctl status mcserver$i"
+            if [[ "$USING_SYSTEMD" == true ]]; then
+                echo "  Start:   systemctl start mcserver$i"
+                echo "  Stop:    systemctl stop mcserver$i"
+                echo "  Restart: systemctl restart mcserver$i"
+                echo "  Status:  systemctl status mcserver$i"
+            else
+                echo "  Start:   /etc/init.d/mcserver$i start"
+                echo "  Stop:    /etc/init.d/mcserver$i stop"
+                echo "  Restart: /etc/init.d/mcserver$i restart"
+                echo "  Status:  /etc/init.d/mcserver$i status"
+            fi
             echo ""
             echo -e "${WHITE}Console Commands:${NC}"
-            echo "  Send command: tmux send-keys -t mcserver$i \"say Hello\" C-m"
-            echo "  Attach console: tmux attach -t mcserver$i"
-            echo "  (Press Ctrl+B, then D to detach)"
+            echo "  Send command: ${CYAN}tmux send-keys -t mcserver$i \"say Hello\" C-m${NC}"
+            echo "  Attach console: ${CYAN}tmux attach -t mcserver$i${NC}"
+            echo "  (Press ${YELLOW}Ctrl+B, then D${NC} to detach)"
             echo ""
             echo -e "${CYAN}----------------------------------------${NC}"
             
@@ -406,6 +549,7 @@ install_server() {
     done
     
     print_success "Installation complete! $installed server(s) installed."
+    read -p "Press Enter to continue..."
 }
 
 # ============================================
@@ -427,12 +571,14 @@ uninstall_server() {
     
     if [[ ${#servers[@]} -eq 0 ]]; then
         print_error "No servers installed"
+        read -p "Press Enter to continue..."
         return 1
     fi
     
     echo "Installed servers:"
     for i in "${servers[@]}"; do
-        echo "  $i. mcserver$i"
+        local status=$(tmux has-session -t "mcserver$i" 2>/dev/null && echo "Running" || echo "Stopped")
+        echo "  ${CYAN}$i.${NC} mcserver$i - ${YELLOW}$status${NC}"
     done
     echo ""
     
@@ -440,6 +586,7 @@ uninstall_server() {
     
     if [[ ! " ${servers[@]} " =~ " ${server_num} " ]]; then
         print_error "Invalid server number"
+        read -p "Press Enter to continue..."
         return 1
     fi
     
@@ -447,19 +594,32 @@ uninstall_server() {
     read -p "Are you sure? (y/N): " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        print_info "Stopping and disabling service..."
-        systemctl stop "mcserver$server_num"
-        systemctl disable "mcserver$server_num" > /dev/null 2>&1
-        rm -f "/etc/systemd/system/mcserver$server_num.service"
-        systemctl daemon-reload
+        print_doing "Stopping server..."
         
-        print_info "Removing user and files..."
+        # Stop server
+        if [[ "$USING_SYSTEMD" == true ]]; then
+            systemctl stop "mcserver$server_num" 2>/dev/null
+            systemctl disable "mcserver$server_num" > /dev/null 2>&1
+            rm -f "/etc/systemd/system/mcserver$server_num.service"
+            systemctl daemon-reload
+        else
+            /etc/init.d/mcserver$server_num stop 2>/dev/null
+            update-rc.d -f mcserver$server_num remove 2>/dev/null
+            rm -f "/etc/init.d/mcserver$server_num"
+        fi
+        
+        # Kill tmux session
+        tmux kill-session -t "mcserver$server_num" 2>/dev/null
+        
+        print_doing "Removing user and files..."
         userdel -r "mcserver$server_num" 2>/dev/null
         
         print_success "Server mcserver$server_num uninstalled"
     else
         print_info "Uninstall cancelled"
     fi
+    
+    read -p "Press Enter to continue..."
 }
 
 # ============================================
@@ -469,12 +629,13 @@ uninstall_server() {
 control_server() {
     local action="$1"
     local action_past="$2"
+    local action_ing="$3"
     
     print_header
     echo -e "${WHITE}${action} Server${NC}"
     echo ""
     
-    # List running servers
+    # List servers
     local servers=()
     for i in {1..10}; do
         if id "mcserver$i" &>/dev/null; then
@@ -484,19 +645,18 @@ control_server() {
     
     if [[ ${#servers[@]} -eq 0 ]]; then
         print_error "No servers installed"
+        read -p "Press Enter to continue..."
         return 1
     fi
     
     echo "Available servers:"
     for i in "${servers[@]}"; do
-        local status=$(systemctl is-active "mcserver$i" 2>/dev/null)
-        local status_color
-        if [[ "$status" == "active" ]]; then
-            status_color="${GREEN}● Running${NC}"
+        local status=$(tmux has-session -t "mcserver$i" 2>/dev/null && echo "Running" || echo "Stopped")
+        if [[ "$status" == "Running" ]]; then
+            echo "  ${CYAN}$i.${NC} mcserver$i - ${GREEN}● Running${NC}"
         else
-            status_color="${RED}○ Stopped${NC}"
+            echo "  ${CYAN}$i.${NC} mcserver$i - ${RED}○ Stopped${NC}"
         fi
-        echo "  $i. mcserver$i - $status_color"
     done
     echo ""
     
@@ -504,16 +664,61 @@ control_server() {
     
     if [[ ! " ${servers[@]} " =~ " ${server_num} " ]]; then
         print_error "Invalid server number"
+        read -p "Press Enter to continue..."
         return 1
     fi
     
-    systemctl "$action" "mcserver$server_num"
+    print_doing "${action_ing} server mcserver$server_num..."
     
-    if [[ $? -eq 0 ]]; then
-        print_success "Server mcserver$server_num ${action_past}"
+    case $action in
+        start)
+            if [[ "$USING_SYSTEMD" == true ]]; then
+                systemctl start "mcserver$server_num" 2>/dev/null
+            else
+                /etc/init.d/mcserver$server_num start 2>/dev/null
+            fi
+            ;;
+        stop)
+            tmux send-keys -t "mcserver$server_num" C-c C-m 2>/dev/null
+            sleep 3
+            tmux kill-session -t "mcserver$server_num" 2>/dev/null
+            if [[ "$USING_SYSTEMD" == true ]]; then
+                systemctl stop "mcserver$server_num" 2>/dev/null
+            else
+                /etc/init.d/mcserver$server_num stop 2>/dev/null
+            fi
+            ;;
+        restart)
+            tmux send-keys -t "mcserver$server_num" C-c C-m 2>/dev/null
+            sleep 3
+            tmux kill-session -t "mcserver$server_num" 2>/dev/null
+            sleep 2
+            if [[ "$USING_SYSTEMD" == true ]]; then
+                systemctl restart "mcserver$server_num" 2>/dev/null
+            else
+                /etc/init.d/mcserver$server_num restart 2>/dev/null
+            fi
+            ;;
+    esac
+    
+    sleep 2
+    
+    # Verify action
+    if [[ "$action" == "stop" ]]; then
+        if ! tmux has-session -t "mcserver$server_num" 2>/dev/null; then
+            print_success "Server mcserver$server_num ${action_past}"
+        else
+            print_error "Failed to ${action} server"
+        fi
     else
-        print_error "Failed to ${action} server mcserver$server_num"
+        if tmux has-session -t "mcserver$server_num" 2>/dev/null; then
+            print_success "Server mcserver$server_num ${action_past}"
+        else
+            print_error "Failed to ${action} server"
+        fi
     fi
+    
+    read -p "Press Enter to continue..."
 }
 
 # ============================================
@@ -530,9 +735,14 @@ list_servers() {
     for i in {1..10}; do
         if id "mcserver$i" &>/dev/null; then
             any_server=true
-            local status=$(systemctl is-active "mcserver$i" 2>/dev/null)
-            local port=$(grep -Po '(?<=server-port=).*' "$BASE_DIR/mcserver$i/server.properties" 2>/dev/null)
+            local status=$(tmux has-session -t "mcserver$i" 2>/dev/null && echo "active" || echo "inactive")
+            local port="19132"
             local players="0"
+            
+            # Get port from server.properties
+            if [[ -f "$BASE_DIR/mcserver$i/server.properties" ]]; then
+                port=$(grep -Po '(?<=server-port=).*' "$BASE_DIR/mcserver$i/server.properties" 2>/dev/null)
+            fi
             
             # Try to get player count from tmux session
             if [[ "$status" == "active" ]]; then
@@ -543,10 +753,11 @@ list_servers() {
             fi
             
             echo -e "${CYAN}Server mcserver$i${NC}"
-            echo "  Status: $(if [[ "$status" == "active" ]]; then echo -e "${GREEN}Running${NC}"; else echo -e "${RED}Stopped${NC}"; fi)"
+            echo "  Status: $(if [[ "$status" == "active" ]]; then echo -e "${GREEN}● Running${NC}"; else echo -e "${RED}○ Stopped${NC}"; fi)"
             echo "  Port: $port"
             echo "  Players: $players"
             echo "  Path: $BASE_DIR/mcserver$i"
+            echo "  Tmux: $(if tmux has-session -t "mcserver$i" 2>/dev/null; then echo -e "${GREEN}Session exists${NC}"; else echo -e "${RED}No session${NC}"; fi)"
             echo ""
         fi
     done
@@ -559,61 +770,101 @@ list_servers() {
 }
 
 # ============================================
-# REAL-TIME MONITOR
+# REAL-TIME MONITOR (WITH EXIT FIX)
 # ============================================
 
 real_time_monitor() {
     print_header
-    echo -e "${WHITE}Real-time Server Monitor (Press Ctrl+C to exit)${NC}"
+    echo -e "${WHITE}Real-time Server Monitor${NC}"
+    echo -e "${YELLOW}Press 'q' or 'Q' to exit${NC}"
+    echo -e "${YELLOW}Press 'r' to refresh immediately${NC}"
     echo ""
     
+    # Save terminal settings
+    old_stty_settings=$(stty -g 2>/dev/null)
+    
+    # Set terminal to raw mode for single key input
+    stty -icanon -echo 2>/dev/null
+    
     while true; do
+        # Clear screen and show header
         clear
         echo -e "${CYAN}========================================${NC}"
-        echo -e "${WHITE}   Server Monitor - $(date '+%H:%M:%S')${NC}"
+        echo -e "${WHITE}   Server Monitor - $(date '+%Y-%m-%d %H:%M:%S')${NC}"
         echo -e "${CYAN}========================================${NC}"
+        echo -e "${YELLOW}Press 'q' to exit | 'r' to refresh${NC}"
         echo ""
         
-        printf "%-12s %-10s %-8s %-8s %-10s %s\n" "SERVER" "STATUS" "CPU%" "RAM(MB)" "PLAYERS" "PORT"
+        # Table header
+        printf "${WHITE}%-12s %-10s %-8s %-8s %-10s %-8s %s${NC}\n" "SERVER" "STATUS" "CPU%" "RAM(MB)" "PLAYERS" "PORT" "UPTIME"
         echo "--------------------------------------------------------------------------------"
+        
+        local any_server=false
         
         for i in {1..10}; do
             if id "mcserver$i" &>/dev/null; then
-                local status=$(systemctl is-active "mcserver$i" 2>/dev/null)
+                any_server=true
+                local status=$(tmux has-session -t "mcserver$i" 2>/dev/null && echo "active" || echo "inactive")
                 local port=$(grep -Po '(?<=server-port=).*' "$BASE_DIR/mcserver$i/server.properties" 2>/dev/null)
                 local cpu=0
                 local mem=0
-                local players="0/?"
+                local players="0/?  "
+                local uptime="-"
                 
                 if [[ "$status" == "active" ]]; then
-                    # Get CPU and memory usage
-                    local pid=$(pgrep -f "tmux.*mcserver$i.*bedrock_server")
+                    # Get bedrock_server process ID
+                    local pid=$(pgrep -f "bedrock_server.*mcserver$i" 2>/dev/null | head -1)
                     if [[ -n "$pid" ]]; then
-                        cpu=$(ps -p $pid -o %cpu --no-headers 2>/dev/null | cut -d. -f1)
+                        cpu=$(ps -p $pid -o %cpu --no-headers 2>/dev/null | awk '{printf "%.1f", $1}')
                         mem=$(ps -p $pid -o rss --no-headers 2>/dev/null | awk '{printf "%.0f", $1/1024}')
                         cpu=${cpu:-0}
                         mem=${mem:-0}
+                        
+                        # Get process uptime
+                        local etime=$(ps -p $pid -o etime --no-headers 2>/dev/null | tr -d ' ')
+                        uptime="$etime"
                     fi
                     
                     # Get player count from logs
                     local player_count=$(tmux capture-pane -t "mcserver$i" -p 2>/dev/null | grep -oP '\d+/\d+ players' | tail -1)
-                    players=${player_count:-"0/?"}
+                    players=${player_count:-"0/?  "}
                     
-                    echo -e "mcserver$i    ${GREEN}● Running${NC}   $cpu     $mem      $players    $port"
+                    printf "mcserver$i    ${GREEN}● Running${NC}   %-8s %-8s %-10s %-8s %s\n" "$cpu" "$mem" "$players" "$port" "$uptime"
                 else
-                    echo -e "mcserver$i    ${RED}○ Stopped${NC}   -       -        -         $port"
+                    printf "mcserver$i    ${RED}○ Stopped${NC}   %-8s %-8s %-10s %-8s %s\n" "-" "-" "-" "$port" "-"
                 fi
             fi
         done
         
+        if [[ "$any_server" == false ]]; then
+            echo -e "${YELLOW}  No servers installed${NC}"
+        fi
+        
         echo ""
-        echo -e "${YELLOW}System Resources:${NC}"
+        echo -e "${WHITE}System Resources:${NC}"
         echo "  CPU Usage: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d. -f1)%"
         echo "  RAM Usage: $(free -m | awk 'NR==2{printf "%.1f/%.1f MB (%.1f%%)", $3, $2, $3*100/$2}')"
         echo "  Disk Usage: $(df -h / | awk 'NR==2{print $5 " of " $2}')"
         
-        sleep 5
+        # Wait for key press with timeout
+        echo ""
+        echo -e "${CYAN}Waiting for input...${NC}"
+        
+        # Read single character with timeout
+        if read -t 2 -n 1 key 2>/dev/null; then
+            if [[ "$key" == "q" ]] || [[ "$key" == "Q" ]]; then
+                break
+            elif [[ "$key" == "r" ]] || [[ "$key" == "R" ]]; then
+                continue
+            fi
+        fi
     done
+    
+    # Restore terminal settings
+    stty "$old_stty_settings" 2>/dev/null
+    
+    print_success "Exited monitor"
+    sleep 1
 }
 
 # ============================================
@@ -629,8 +880,7 @@ enter_server_console() {
     local servers=()
     for i in {1..10}; do
         if id "mcserver$i" &>/dev/null; then
-            local status=$(systemctl is-active "mcserver$i" 2>/dev/null)
-            if [[ "$status" == "active" ]]; then
+            if tmux has-session -t "mcserver$i" 2>/dev/null; then
                 servers+=($i)
             fi
         fi
@@ -644,7 +894,7 @@ enter_server_console() {
     
     echo "Running servers:"
     for i in "${servers[@]}"; do
-        echo "  $i. mcserver$i"
+        echo "  ${CYAN}$i.${NC} mcserver$i"
     done
     echo ""
     
@@ -658,14 +908,15 @@ enter_server_console() {
     
     echo ""
     echo -e "${YELLOW}Console Options:${NC}"
-    echo "  1. Attach to tmux (full console)"
-    echo "  2. Command mode (send individual commands)"
-    read -p "Select option (1-2): " console_mode
+    echo "  ${CYAN}1.${NC} Attach to tmux (full console)"
+    echo "  ${CYAN}2.${NC} Command mode (send individual commands)"
+    echo "  ${CYAN}3.${NC} View last 20 lines of console"
+    read -p "Select option (1-3): " console_mode
     
     case $console_mode in
         1)
             print_info "Attaching to mcserver$server_num console..."
-            print_info "Press Ctrl+B then D to detach"
+            print_info "${YELLOW}Press Ctrl+B then D to detach${NC}"
             sleep 2
             tmux attach -t "mcserver$server_num"
             ;;
@@ -682,29 +933,81 @@ enter_server_console() {
                 if [[ "$cmd" == "exit" ]]; then
                     break
                 elif [[ "$cmd" == "help" ]]; then
+                    echo ""
                     echo "Available commands:"
-                    echo "  say <message>  - Broadcast message"
-                    echo "  list           - List players"
-                    echo "  stop           - Stop server"
-                    echo "  reload         - Reload server"
-                    echo "  save           - Save world"
-                    echo "  help           - Show this help"
-                    echo "  exit           - Exit console mode"
+                    echo "  ${GREEN}say <message>${NC}  - Broadcast message"
+                    echo "  ${GREEN}list${NC}           - List players"
+                    echo "  ${GREEN}stop${NC}           - Stop server"
+                    echo "  ${GREEN}reload${NC}         - Reload server"
+                    echo "  ${GREEN}save${NC}           - Save world"
+                    echo "  ${GREEN}help${NC}           - Show this help"
+                    echo "  ${GREEN}exit${NC}           - Exit console mode"
+                    echo "  ${GREEN}clear${NC}          - Clear screen"
+                    echo ""
+                elif [[ "$cmd" == "clear" ]]; then
+                    clear
                 elif [[ -n "$cmd" ]]; then
                     tmux send-keys -t "mcserver$server_num" "$cmd" C-m
                     print_success "Command sent"
                     
                     # Show last line of output
-                    sleep 0.5
-                    tmux capture-pane -t "mcserver$server_num" -p | tail -3
+                    sleep 1
+                    echo ""
+                    echo -e "${CYAN}Last output:${NC}"
+                    tmux capture-pane -t "mcserver$server_num" -p | tail -5
                     echo ""
                 fi
             done
             ;;
+        3)
+            echo ""
+            echo -e "${CYAN}Last 20 lines from mcserver$server_num console:${NC}"
+            echo "----------------------------------------"
+            tmux capture-pane -t "mcserver$server_num" -p | tail -20
+            echo "----------------------------------------"
+            read -p "Press Enter to continue..."
+            ;;
         *)
             print_error "Invalid option"
+            sleep 2
             ;;
     esac
+}
+
+# ============================================
+# SHOW SERVER STATUS
+# ============================================
+
+show_server_status() {
+    print_header
+    echo -e "${WHITE}Server Status Overview${NC}"
+    echo ""
+    
+    local running=0
+    local stopped=0
+    
+    for i in {1..10}; do
+        if id "mcserver$i" &>/dev/null; then
+            if tmux has-session -t "mcserver$i" 2>/dev/null; then
+                ((running++))
+            else
+                ((stopped++))
+            fi
+        fi
+    done
+    
+    echo "  ${GREEN}Running: $running${NC}"
+    echo "  ${RED}Stopped: $stopped${NC}"
+    echo "  ${CYAN}Total: $((running+stopped))${NC}"
+    echo ""
+    
+    # Show system resources
+    echo -e "${WHITE}System Resources:${NC}"
+    echo "  CPU Load: $(uptime | awk -F'load average:' '{print $2}')"
+    echo "  Memory: $(free -h | awk 'NR==2{print $3 "/" $2}')"
+    echo "  Disk: $(df -h / | awk 'NR==2{print $3 "/" $2 " (" $5 ")"}')"
+    
+    read -p "Press Enter to continue..."
 }
 
 # ============================================
@@ -715,31 +1018,39 @@ main_menu() {
     while true; do
         print_header
         
+        # Show systemd status
+        if [[ "$USING_SYSTEMD" == false ]]; then
+            echo -e "${YELLOW}⚠ Running without systemd (using init.d scripts)${NC}"
+            echo ""
+        fi
+        
         echo -e "${WHITE}Main Menu${NC}"
         echo ""
-        echo "  1. Install Server"
-        echo "  2. Uninstall Server"
-        echo "  3. Start Server"
-        echo "  4. Stop Server"
-        echo "  5. Restart Server"
-        echo "  6. List Servers"
-        echo "  7. Real-time Monitor"
-        echo "  8. Enter Server Console"
-        echo "  9. Exit"
+        echo "  ${CYAN}1.${NC} Install Server"
+        echo "  ${CYAN}2.${NC} Uninstall Server"
+        echo "  ${CYAN}3.${NC} Start Server"
+        echo "  ${CYAN}4.${NC} Stop Server"
+        echo "  ${CYAN}5.${NC} Restart Server"
+        echo "  ${CYAN}6.${NC} List Servers"
+        echo "  ${CYAN}7.${NC} Real-time Monitor"
+        echo "  ${CYAN}8.${NC} Enter Server Console"
+        echo "  ${CYAN}9.${NC} Server Status"
+        echo "  ${CYAN}10.${NC} Exit"
         echo ""
         
-        read -p "Select option (1-9): " choice
+        read -p "Select option (1-10): " choice
         
         case $choice in
             1) install_server ;;
             2) uninstall_server ;;
-            3) control_server "start" "started" ;;
-            4) control_server "stop" "stopped" ;;
-            5) control_server "restart" "restarted" ;;
+            3) control_server "start" "started" "Starting" ;;
+            4) control_server "stop" "stopped" "Stopping" ;;
+            5) control_server "restart" "restarted" "Restarting" ;;
             6) list_servers ;;
             7) real_time_monitor ;;
             8) enter_server_console ;;
-            9) 
+            9) show_server_status ;;
+            10) 
                 print_success "Goodbye!"
                 exit 0 
                 ;;
@@ -755,14 +1066,34 @@ main_menu() {
 # SCRIPT INITIALIZATION
 # ============================================
 
+# Set trap for Ctrl+C
+trap trap_ctrl_c SIGINT
+
 # Check if running as root
 check_root
+
+# Show system info
+clear
+echo -e "${CYAN}========================================${NC}"
+echo -e "${WHITE}   Minecraft Bedrock Manager ${VERSION}${NC}"
+echo -e "${CYAN}========================================${NC}"
+echo ""
 
 # Install dependencies
 install_dependencies
 
 # Create base directory if it doesn't exist
 mkdir -p "$BASE_DIR"
+
+# Show startup message
+if [[ "$USING_SYSTEMD" == true ]]; then
+    print_success "Systemd detected - using systemd services"
+else
+    print_warning "Systemd not detected - using init.d scripts"
+    print_info "All server management will still work normally"
+fi
+
+sleep 2
 
 # Start main menu
 main_menu
